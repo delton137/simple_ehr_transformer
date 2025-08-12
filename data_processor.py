@@ -1040,6 +1040,53 @@ class OMOPDataProcessor:
         for i in range(model_config.max_quantile_tokens):
             self.vocab[f"Q{i}"] = len(self.vocab)
         
+        # Scan timelines once to collect categorical values used by tokenization
+        genders = set()
+        races = set()
+        year_intervals = set()
+        visit_types = set()
+        units = set()
+
+        for patient_id, timeline in patient_timelines.items():
+            # Static event
+            static_event = next((e for e in timeline if e.get('event_type') == 'static'), None)
+            if static_event:
+                g = static_event.get('gender')
+                r = static_event.get('race')
+                if g is not None:
+                    genders.add(g)
+                if r is not None:
+                    races.add(r)
+                # Birth year interval as used by _get_year_interval
+                by = static_event.get('birth_year')
+                if by:
+                    base_year = 1970
+                    interval = (by - base_year) // 5
+                    start_year = base_year + interval * 5
+                    end_year = start_year + 5
+                    year_intervals.add(f"{start_year}-{end_year}")
+            # Events
+            for ev in timeline:
+                if ev.get('event_type') == 'admission':
+                    vt = ev.get('visit_type', 'unknown')
+                    visit_types.add(vt)
+                elif ev.get('event_type') == 'measurement':
+                    u = ev.get('unit_concept_id', 'unknown')
+                    if u is not None:
+                        units.add(u)
+
+        # Add categorical tokens used by tokenization to avoid defaulting to PAD (0)
+        for g in genders:
+            self.vocab[f"GENDER_{g}"] = len(self.vocab)
+        for r in races:
+            self.vocab[f"RACE_{r}"] = len(self.vocab)
+        for yi in sorted(year_intervals):
+            self.vocab[f"YEAR_{yi}"] = len(self.vocab)
+        for vt in visit_types:
+            self.vocab[f"VISIT_TYPE_{vt}"] = len(self.vocab)
+        for u in units:
+            self.vocab[f"UNIT_{u}"] = len(self.vocab)
+
         # Add concept tokens from data (process in chunks)
         concept_counts = Counter()
         
@@ -1065,6 +1112,9 @@ class OMOPDataProcessor:
                     elif event['event_type'] == 'measurement':
                         concept_id = event.get('measurement_concept_id', 'unknown')
                         concept_counts[f"MEASUREMENT_{concept_id}"] += 1
+                    elif event['event_type'] == 'observation':
+                        concept_id = event.get('observation_concept_id', 'unknown')
+                        concept_counts[f"OBSERVATION_{concept_id}"] += 1
             
             # Clear memory after each chunk
             gc.collect()
@@ -1089,7 +1139,7 @@ class OMOPDataProcessor:
         logger.info(f"  - Age intervals: {len(self.age_mappings)}")
         logger.info(f"  - Time intervals: {len(self.time_interval_mappings)}")
         logger.info(f"  - Quantile tokens: {model_config.max_quantile_tokens}")
-        logger.info(f"  - Concept tokens: {len([k for k in self.vocab.keys() if k.startswith(('CONDITION_', 'DRUG_', 'PROCEDURE_', 'MEASUREMENT_'))])}")
+        logger.info(f"  - Concept tokens: {len([k for k in self.vocab.keys() if k.startswith(('CONDITION_', 'DRUG_', 'PROCEDURE_', 'MEASUREMENT_', 'OBSERVATION_'))])}")
     
     def tokenize_timeline(self, timeline: List[Dict], patient_age: float) -> List[int]:
         """Convert a patient timeline to tokens"""
@@ -1192,6 +1242,9 @@ class OMOPDataProcessor:
             # Unit token
             unit = event.get('unit_concept_id', 'unknown')
             tokens.append(self.vocab.get(f"UNIT_{unit}", 0))
+        elif event_type == 'observation':
+            concept_id = event.get('observation_concept_id', 'unknown')
+            tokens.append(self.vocab.get(f"OBSERVATION_{concept_id}", 0))
         
         return tokens
     
