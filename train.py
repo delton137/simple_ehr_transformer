@@ -366,7 +366,8 @@ def main():
     if local_rank >= 0 and world_size > 1:
         ddp = True
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')
+            from datetime import timedelta
+            dist.init_process_group(backend='nccl', timeout=timedelta(minutes=15))
     rank = dist.get_rank() if dist.is_initialized() else 0
     is_rank0 = (rank == 0)
 
@@ -441,8 +442,8 @@ def main():
         data_processor = PHTDataProcessor(tokenized_timelines, len(vocab))
         # Respect max_seq_len from args
         train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
-        train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if ddp else None
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if ddp else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if ddp else None
         # Drop last batch in train to avoid uneven last batch across ranks
         train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=(not ddp), num_workers=args.num_workers, sampler=train_sampler, drop_last=True)
         val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, sampler=val_sampler, drop_last=False)
@@ -461,7 +462,14 @@ def main():
         model = create_ethos_model(len(vocab))
         model = model.to(device)
         if ddp:
-            model = DDP(model, device_ids=[device.index] if device.type == 'cuda' else None)
+            # Use static_graph to reduce collective overhead when graph is fixed
+            model = DDP(
+                model,
+                device_ids=[device.index] if device.type == 'cuda' else None,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
+            )
         elif args.device in ('auto', 'cuda') and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             # Fallback to DataParallel only when not using DDP
             if is_rank0:
