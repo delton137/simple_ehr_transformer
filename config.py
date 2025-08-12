@@ -11,7 +11,7 @@ from typing import List, Dict, Any
 class ModelConfig:
     """Model configuration parameters"""
     # Model architecture
-    vocab_size: int = 10000  # Will be set dynamically based on data
+    vocab_size: int = 50000  # Increased to allow for more concept tokens
     d_model: int = 768
     n_heads: int = 12
     n_layers: int = 12
