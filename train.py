@@ -14,7 +14,7 @@ import argparse
 from tqdm import tqdm
 import time
 import matplotlib.pyplot as plt
-import seaborn as sns
+
 
 from config import model_config, data_config
 from data_loader import PHTDataProcessor, analyze_data_distribution
@@ -262,6 +262,15 @@ class ETHOSTrainer:
         self.plot_training_curves()
         logger.info("Training completed!")
 
+def load_processed_data(data_dir: str):
+    """Load tokenized timelines and vocabulary pickles from data_dir."""
+    import pickle
+    with open(os.path.join(data_dir, 'tokenized_timelines.pkl'), 'rb') as f:
+        tokenized_timelines = pickle.load(f)
+    with open(os.path.join(data_dir, 'vocabulary.pkl'), 'rb') as f:
+        vocab = pickle.load(f)
+    return tokenized_timelines, vocab
+
 def main():
     """Main training function"""
     parser = argparse.ArgumentParser(description='Train ETHOS Transformer Model')
@@ -348,80 +357,16 @@ def main():
         print(f"❌ Error creating model: {e}")
         return
     
-    # Setup training
+    # Setup training via ETHOSTrainer
     print("\n⚙️  Setting up training...")
     try:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs)
-        criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
-        
-        # Create model directory with tag
-        model_dir = os.path.join("models", args.tag) if args.tag else "models"
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # Training loop
-        print(f"\n🎯 Starting training for {args.max_epochs} epochs...")
-        print(f"💾 Models will be saved to: {model_dir}/")
-        
-        best_val_loss = float('inf')
-        start_epoch = 0
-        
-        # Resume from checkpoint if specified
-        if args.resume:
-            if os.path.exists(args.resume):
-                checkpoint = torch.load(args.resume, map_location=device)
-                model.load_state_dict(checkpoint['model_state_dict'])
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                start_epoch = checkpoint['epoch'] + 1
-                best_val_loss = checkpoint['best_val_loss']
-                print(f"✅ Resumed from checkpoint: {args.resume}")
-                print(f"📅 Starting from epoch: {start_epoch}")
-            else:
-                print(f"⚠️  Checkpoint not found: {args.resume}")
-                print("Starting training from scratch...")
-        
-        # Training loop
-        for epoch in range(start_epoch, args.max_epochs):
-            # Training
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-            
-            # Validation
-            val_loss = validate_epoch(model, val_loader, criterion, device)
-            
-            # Learning rate scheduling
-            scheduler.step()
-            
-            # Logging
-            print(f"Epoch {epoch+1:3d}/{args.max_epochs} | "
-                  f"Train Loss: {train_loss:.4f} | "
-                  f"Val Loss: {val_loss:.4f} | "
-                  f"LR: {scheduler.get_last_lr()[0]:.6f}")
-            
-            # Save checkpoint
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss': best_val_loss,
-                'vocab_size': len(vocab),
-                'config': model_config
-            }
-            
-            # Save latest checkpoint
-            torch.save(checkpoint, os.path.join(model_dir, 'latest_checkpoint.pth'))
-            
-            # Save best checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(checkpoint, os.path.join(model_dir, 'best_checkpoint.pth'))
-                print(f"💾 New best model saved! (Val Loss: {val_loss:.4f})")
-        
-        print(f"\n🎉 Training completed!")
-        print(f"💾 Best model saved to: {model_dir}/best_checkpoint.pth")
-        print(f"💾 Latest model saved to: {model_dir}/latest_checkpoint.pth")
-        
+        trainer_config = {
+            'learning_rate': args.learning_rate,
+            'max_epochs': args.max_epochs,
+            'gradient_clip': model_config.gradient_clip,
+        }
+        trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config)
+        trainer.train(resume_from=args.resume)
     except Exception as e:
         print(f"❌ Training error: {e}")
         import traceback
