@@ -185,7 +185,7 @@ class OMOPDataProcessor:
     def _compute_stats_polars(self, events_lazy: 'pl.LazyFrame') -> Tuple[Counter, Dict[str, np.ndarray]]:
         logger.info("[FAST] Computing concept frequencies (Polars)...")
         counts = (events_lazy
-                  .groupby(["et", "cid"])  # lazy groupby
+                  .group_by(["et", "cid"])  # polars uses group_by in recent versions
                   .agg(pl.len().alias("n"))
                   .collect(streaming=True))
         concept_counts: Counter = Counter()
