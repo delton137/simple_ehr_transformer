@@ -86,9 +86,9 @@ class OMOPDataProcessor:
               .rename({ts_col: "ts", cid_col: "cid"}))
         # Ensure expected columns exist with unified names
         to_add = []
-        if 'value_as_number' not in lf.columns:
+        if 'value_as_number' not in names:
             to_add.append(pl.lit(None).cast(pl.Float64).alias('value_as_number'))
-        if 'unit_concept_id' not in lf.columns:
+        if 'unit_concept_id' not in names:
             to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
         if to_add:
             lf = lf.with_columns(to_add)
@@ -134,7 +134,10 @@ class OMOPDataProcessor:
             # Add a bucket column to limit number of partitions
             # 1024 buckets keeps directory fanout manageable
             pid_col = tbl.column('person_id')
-            buckets = pc.mod(pid_col, pa.scalar(1024, type=pa.int64()))
+            # Compute pid % 1024 using floor_divide to maintain compatibility
+            divisor = pa.scalar(1024, type=pa.int64())
+            q = pc.floor_divide(pid_col, divisor)
+            buckets = pc.subtract(pid_col, pc.multiply(divisor, q))
             tbl = tbl.append_column('pid_bucket', buckets)
             pds.write_dataset(
                 tbl,
