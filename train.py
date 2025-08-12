@@ -353,6 +353,8 @@ def main():
     parser.add_argument('--use_amp', action='store_true', help='Enable mixed precision (AMP). If omitted and CUDA is available, AMP will be auto-enabled.')
     parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps (default: 4)')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
+    parser.add_argument('--print_timeline_stats', action='store_true',
+                       help='Print train/val patient counts and training timeline length histogram before training')
 
     args = parser.parse_args()
 
@@ -442,6 +444,32 @@ def main():
         data_processor = PHTDataProcessor(tokenized_timelines, len(vocab), train_split=0.9, seed=42)
         # Respect max_seq_len from args
         train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
+        # Optional stats before loader creation
+        if args.print_timeline_stats and is_rank0:
+            def _count_bucket(n: int) -> str:
+                if n <= 10:
+                    return '0-10'
+                if n <= 20:
+                    return '10-20'
+                if n <= 100:
+                    return '20-100'
+                if n <= 200:
+                    return '100-200'
+                if n <= 800:
+                    return '200-800'
+                return '>800'
+            train_lengths = [len(seq) for seq in data_processor.train_data.values()]
+            val_patients = len(data_processor.val_data)
+            train_patients = len(data_processor.train_data)
+            buckets = {'0-10':0,'10-20':0,'20-100':0,'100-200':0,'200-800':0,'>800':0}
+            for n in train_lengths:
+                buckets[_count_bucket(n)] += 1
+            print("\n📊 Timeline stats (pre-dataloader):")
+            print(f"  Train patients: {train_patients}")
+            print(f"  Val patients:   {val_patients}")
+            print("  Training timeline length histogram:")
+            for k in ['0-10','10-20','20-100','100-200','200-800','>800']:
+                print(f"    {k}: {buckets[k]}")
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if ddp else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if ddp else None
         # Drop last batch in train to avoid uneven last batch across ranks
