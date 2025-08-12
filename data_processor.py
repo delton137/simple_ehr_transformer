@@ -135,7 +135,10 @@ class OMOPDataProcessor:
         os.makedirs(self.events_dir, exist_ok=True)
         # Collect lazily (streaming) then write partitioned with PyArrow dataset API
         try:
-            tbl = events_lazy.collect().to_arrow()
+            df_events = events_lazy.collect()
+            total_rows = df_events.height
+            logger.info(f"[FAST] Events rows: {total_rows:,}")
+            tbl = df_events.to_arrow()
             import pyarrow.dataset as pds
             pds.write_dataset(
                 tbl,
@@ -228,7 +231,9 @@ class OMOPDataProcessor:
             return tokenized
         # Iterate over pid_bucket partitions and group by person_id inside each file
         files = list(Path(self.events_dir).rglob('*.parquet'))
-        for file in tqdm(files, desc="[FAST] Tokenizing partitions", unit="file"):
+        pbar_files = tqdm(files, desc="[FAST] Tokenizing partitions", unit="file")
+        pbar_patients = tqdm(total=0, desc="[FAST] Patients tokenized", unit="pt")
+        for file in pbar_files:
             try:
                 df = pl.read_parquet(str(file))
                 if df.is_empty():
@@ -241,6 +246,13 @@ class OMOPDataProcessor:
                     continue
                 # Sort for deterministic order and group by person_id
                 df = df.sort(["person_id", "ts"]) 
+                # Update patient total for ETA
+                try:
+                    num_groups = int(df.get_column("person_id").n_unique())
+                    pbar_patients.total += num_groups
+                    pbar_patients.refresh()
+                except Exception:
+                    num_groups = None
                 gb = df.group_by("person_id")
                 for (pid,), sub in gb:
                     pid = int(pid)
@@ -286,9 +298,12 @@ class OMOPDataProcessor:
                     patient_age = (current_year - birth_year) if birth_year else 50
                     tokens = self.tokenize_timeline(timeline, patient_age)
                     tokenized[pid] = tokens
+                    pbar_patients.update(1)
             except Exception as e:
                 logger.warning(f"Tokenization failed for {file}: {e}")
                 continue
+        pbar_files.close()
+        pbar_patients.close()
         logger.info(f"[FAST] Tokenized {len(tokenized)} patients")
         return tokenized
     
