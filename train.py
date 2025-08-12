@@ -438,10 +438,16 @@ def main():
             if args.print_random_timeline and tokenized_timelines:
                 import random
                 id_to_token = {v: k for k, v in vocab.items()}
-                rand_pid = random.choice(list(tokenized_timelines.keys()))
+                # Prefer longer timelines (>100 tokens); fallback to the longest available
+                candidates = [pid for pid, seq in tokenized_timelines.items() if len(seq) > 100]
+                if candidates:
+                    rand_pid = random.choice(candidates)
+                else:
+                    # Fallback: pick the longest timeline
+                    rand_pid = max(tokenized_timelines.keys(), key=lambda pid: len(tokenized_timelines[pid]))
                 seq = tokenized_timelines[rand_pid]
                 decoded = [id_to_token.get(t, f'UNKNOWN_{t}') for t in seq]
-                print("\n🧪 Random patient timeline:")
+                print("\n🧪 Sample patient timeline (prefer >100 tokens):")
                 print(f"  Patient ID: {rand_pid}")
                 print(f"  Sequence length: {len(seq)}")
                 preview = 200
