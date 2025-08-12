@@ -111,23 +111,37 @@ This creates separate directories:
 
 ### 2. Training
 
-Train the ETHOS transformer model:
+Train the ETHOS transformer model (memory-friendly, multi-GPU enabled):
 
 ```bash
-# Train with default data directory
-python train.py --batch_size 32 --max_epochs 100 --learning_rate 3e-4
+# Optional: select multiple GPUs and improve allocator behavior
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Train with tagged dataset
-python train.py --tag aou_2023 --batch_size 32 --max_epochs 100
+python train.py \
+  --data_dir processed_data \
+  --batch_size 8 \
+  --grad_accum_steps 4 \
+  --max_seq_len 1024 \
+  --use_amp \
+  --max_epochs 100 \
+  --learning_rate 3e-4 \
+  --device cuda
 
-# Train with custom data directory
-python train.py --data_dir processed_data_aou_2023 --batch_size 32
+# Tagged dataset
+python train.py --tag aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --device cuda
+
+# Custom data directory
+python train.py --data_dir processed_data_aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --device cuda
 ```
 
 Training options:
 - `--tag`: Dataset tag to use (automatically finds `processed_data_{tag}/`)
 - `--data_dir`: Directory containing processed data (default: `processed_data/`)
 - `--batch_size`: Training batch size (default: 32)
+- `--grad_accum_steps`: Gradient accumulation steps (default: 1)
+- `--max_seq_len`: Max sequence length per sample (default: from config)
+- `--use_amp`: Enable mixed precision
 - `--max_epochs`: Maximum training epochs (default: 100)
 - `--learning_rate`: Learning rate (default: 3e-4)
 - `--device`: Device to use (auto/cuda/cpu, default: auto)
@@ -136,10 +150,10 @@ Training options:
 **Tag-based Training:**
 ```bash
 # Train on All of Us 2023 data
-python train.py --tag aou_2023 --batch_size 64 --max_epochs 200
+python train.py --tag aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --max_epochs 200
 
 # Train on MIMIC-IV data  
-python train.py --tag mimic_iv --batch_size 32 --max_epochs 100
+python train.py --tag mimic_iv --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --max_epochs 100
 
 # Models are saved to separate directories:
 # - models/aou_2023/

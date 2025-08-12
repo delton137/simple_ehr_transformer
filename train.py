@@ -14,10 +14,11 @@ import argparse
 from tqdm import tqdm
 import time
 import matplotlib.pyplot as plt
+from typing import Optional
 
 
 from config import model_config, data_config
-from data_loader import PHTDataProcessor, analyze_data_distribution
+from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
 from transformer_model import create_ethos_model
 
 # Set up logging
@@ -40,6 +41,8 @@ class ETHOSTrainer:
         self.val_loader = val_loader
         self.device = device
         self.config = config
+        self.use_amp: bool = bool(config.get('use_amp', False))
+        self.grad_accum_steps: int = int(config.get('grad_accum_steps', 1))
         
         # Training components
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
@@ -55,6 +58,13 @@ class ETHOSTrainer:
             T_max=len(train_loader) * config['max_epochs'],
             eta_min=1e-6
         )
+        
+        # AMP scaler
+        self.scaler: Optional[torch.cuda.amp.GradScaler]
+        if self.use_amp and torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
         
         # Training state
         self.current_epoch = 0
@@ -82,29 +92,45 @@ class ETHOSTrainer:
             target_ids = target_ids.to(self.device)
             
             # Forward pass
-            self.optimizer.zero_grad()
-            logits = self.model(input_ids)
+            if (batch_idx % self.grad_accum_steps) == 0:
+                self.optimizer.zero_grad()
             
-            # Reshape for loss calculation
-            batch_size, seq_len, vocab_size = logits.size()
-            logits = logits.view(-1, vocab_size)
-            targets = target_ids.view(-1)
+            if self.scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logits = self.model(input_ids)
+                    batch_size, seq_len, vocab_size = logits.size()
+                    logits = logits.view(-1, vocab_size)
+                    targets = target_ids.view(-1)
+                    loss = self.criterion(logits, targets)
+                    loss = loss / self.grad_accum_steps
+                self.scaler.scale(loss).backward()
+            else:
+                logits = self.model(input_ids)
+                # Reshape for loss calculation
+                batch_size, seq_len, vocab_size = logits.size()
+                logits = logits.view(-1, vocab_size)
+                targets = target_ids.view(-1)
+                # Calculate loss
+                loss = self.criterion(logits, targets)
+                loss = loss / self.grad_accum_steps
+                # Backward pass
+                loss.backward()
             
-            # Calculate loss
-            loss = self.criterion(logits, targets)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['gradient_clip'])
-            
-            # Update parameters
-            self.optimizer.step()
-            self.scheduler.step()
+            # Step optimizer on accumulation boundary
+            if ((batch_idx + 1) % self.grad_accum_steps) == 0 or ((batch_idx + 1) == len(self.train_loader)):
+                # Gradient clipping
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['gradient_clip'])
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.scheduler.step()
             
             # Update metrics
-            total_loss += loss.item()
+            total_loss += loss.item() * self.grad_accum_steps
             num_batches += 1
             
             # Update progress bar
@@ -132,15 +158,21 @@ class ETHOSTrainer:
                 target_ids = target_ids.to(self.device)
                 
                 # Forward pass
-                logits = self.model(input_ids)
-                
-                # Reshape for loss calculation
-                batch_size, seq_len, vocab_size = logits.size()
-                logits = logits.view(-1, vocab_size)
-                targets = target_ids.view(-1)
-                
-                # Calculate loss
-                loss = self.criterion(logits, targets)
+                if self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        logits = self.model(input_ids)
+                        batch_size, seq_len, vocab_size = logits.size()
+                        logits = logits.view(-1, vocab_size)
+                        targets = target_ids.view(-1)
+                        loss = self.criterion(logits, targets)
+                else:
+                    logits = self.model(input_ids)
+                    # Reshape for loss calculation
+                    batch_size, seq_len, vocab_size = logits.size()
+                    logits = logits.view(-1, vocab_size)
+                    targets = target_ids.view(-1)
+                    # Calculate loss
+                    loss = self.criterion(logits, targets)
                 
                 # Update metrics
                 total_loss += loss.item()
@@ -289,6 +321,11 @@ def main():
                        help='Device to use (default: auto)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume training from checkpoint')
+    parser.add_argument('--max_seq_len', type=int, default=model_config.max_seq_len,
+                       help='Max sequence length per sample (default: from config)')
+    parser.add_argument('--use_amp', action='store_true', help='Enable mixed precision (AMP)')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
     
     args = parser.parse_args()
     
@@ -325,6 +362,13 @@ def main():
         device = torch.device(args.device)
     
     print(f"💻 Device: {device}")
+    # Enable TF32 for speed/memory on Ampere+ GPUs
+    if device.type == 'cuda':
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            torch.set_float32_matmul_precision('medium')  # type: ignore[attr-defined]
+        except Exception:
+            pass
     
     # Load data
     print("\n📊 Loading data...")
@@ -340,7 +384,10 @@ def main():
     print("\n🔧 Creating data loaders...")
     try:
         data_processor = PHTDataProcessor(tokenized_timelines, len(vocab))
-        train_loader, val_loader = data_processor.create_dataloaders(batch_size=args.batch_size)
+        # Respect max_seq_len from args
+        train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
+        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         print(f"✅ Training batches: {len(train_loader)}")
         print(f"✅ Validation batches: {len(val_loader)}")
     except Exception as e:
@@ -357,6 +404,11 @@ def main():
         print(f"❌ Error creating model: {e}")
         return
     
+    # Multi-GPU support (DataParallel for simplicity)
+    if args.device in ('auto', 'cuda') and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"🧮 Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = torch.nn.DataParallel(model)
+
     # Setup training via ETHOSTrainer
     print("\n⚙️  Setting up training...")
     try:
@@ -364,6 +416,8 @@ def main():
             'learning_rate': args.learning_rate,
             'max_epochs': args.max_epochs,
             'gradient_clip': model_config.gradient_clip,
+            'use_amp': args.use_amp,
+            'grad_accum_steps': args.grad_accum_steps,
         }
         trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config)
         trainer.train(resume_from=args.resume)
