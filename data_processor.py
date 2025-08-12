@@ -166,50 +166,90 @@ class OMOPDataProcessor:
             import pyarrow.parquet as pq
             import pyarrow as pa
             
-            # Read the parquet file metadata first
-            parquet_file = pq.ParquetFile(file_path)
-            schema = parquet_file.schema
-            
-            # Check if we have dbdate columns
-            dbdate_columns = []
-            for field in schema:
-                if str(field.type) == 'dbdate':
-                    dbdate_columns.append(field.name)
-            
-            if not dbdate_columns:
-                logger.info("No dbdate columns found, using standard loading")
+            # Try to read the data directly first
+            try:
+                table = pq.read_table(file_path, use_threads=True)
+                df = table.to_pandas()
+                logger.info(f"Successfully loaded table with {len(df)} rows")
+            except Exception as e:
+                logger.info(f"Direct loading failed: {e}")
                 return None
             
-            logger.info(f"Found dbdate columns: {dbdate_columns}")
+            # Look for columns that might be dbdate (datetime-like columns with issues)
+            potential_dbdate_cols = []
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    # Check if this looks like a date column
+                    if any(keyword in col.lower() for keyword in ['date', 'time', 'start', 'end']):
+                        potential_dbdate_cols.append(col)
             
-            # Read the raw data as bytes to handle custom types
-            table = pq.read_table(file_path, use_threads=True)
+            if not potential_dbdate_cols:
+                logger.info("No potential dbdate columns found")
+                return df
             
-            # Convert dbdate columns to datetime
-            df = table.to_pandas()
+            logger.info(f"Found potential dbdate columns: {potential_dbdate_cols}")
             
-            for col in dbdate_columns:
+            # Try to convert these columns to datetime
+            for col in potential_dbdate_cols:
                 if col in df.columns:
-                    logger.info(f"Converting dbdate column: {col}")
-                    # Convert dbdate to datetime - dbdate is often stored as integer days since epoch
+                    logger.info(f"Attempting to convert column: {col}")
+                    
+                    # Sample a few values to see what we're working with
+                    sample_values = df[col].dropna().head(5).tolist()
+                    logger.info(f"Sample values from {col}: {sample_values}")
+                    
+                    # Try different conversion strategies
+                    conversion_success = False
+                    
+                    # Strategy 1: Try as integer days since epoch
                     try:
-                        # Try to convert as integer days since epoch
-                        df[col] = pd.to_datetime(df[col], unit='D', errors='coerce')
-                        logger.info(f"Converted {col} from days since epoch")
-                    except:
+                        temp_df = df.copy()
+                        temp_df[col] = pd.to_datetime(temp_df[col], unit='D', errors='coerce')
+                        if temp_df[col].notna().sum() > 0:
+                            df[col] = temp_df[col]
+                            logger.info(f"Successfully converted {col} from days since epoch")
+                            conversion_success = True
+                    except Exception as e:
+                        logger.info(f"Days since epoch conversion failed for {col}: {e}")
+                    
+                    # Strategy 2: Try as integer seconds since epoch
+                    if not conversion_success:
                         try:
-                            # Try to convert as integer seconds since epoch
-                            df[col] = pd.to_datetime(df[col], unit='s', errors='coerce')
-                            logger.info(f"Converted {col} from seconds since epoch")
-                        except:
-                            try:
-                                # Try to convert as integer milliseconds since epoch
-                                df[col] = pd.to_datetime(df[col], unit='ms', errors='coerce')
-                                logger.info(f"Converted {col} from milliseconds since epoch")
-                            except:
-                                # Last resort: try to parse as string
-                                logger.warning(f"Could not convert {col} from numeric format, trying string parsing")
-                                df[col] = pd.to_datetime(df[col], errors='coerce')
+                            temp_df = df.copy()
+                            temp_df[col] = pd.to_datetime(temp_df[col], unit='s', errors='coerce')
+                            if temp_df[col].notna().sum() > 0:
+                                df[col] = temp_df[col]
+                                logger.info(f"Successfully converted {col} from seconds since epoch")
+                                conversion_success = True
+                        except Exception as e:
+                            logger.info(f"Seconds since epoch conversion failed for {col}: {e}")
+                    
+                    # Strategy 3: Try as integer milliseconds since epoch
+                    if not conversion_success:
+                        try:
+                            temp_df = df.copy()
+                            temp_df[col] = pd.to_datetime(temp_df[col], unit='ms', errors='coerce')
+                            if temp_df[col].notna().sum() > 0:
+                                df[col] = temp_df[col]
+                                logger.info(f"Successfully converted {col} from milliseconds since epoch")
+                                conversion_success = True
+                        except Exception as e:
+                            logger.info(f"Milliseconds since epoch conversion failed for {col}: {e}")
+                    
+                    # Strategy 4: Try string parsing
+                    if not conversion_success:
+                        try:
+                            temp_df = df.copy()
+                            temp_df[col] = pd.to_datetime(temp_df[col], errors='coerce')
+                            if temp_df[col].notna().sum() > 0:
+                                df[col] = temp_df[col]
+                                logger.info(f"Successfully converted {col} from string parsing")
+                                conversion_success = True
+                        except Exception as e:
+                            logger.info(f"String parsing conversion failed for {col}: {e}")
+                    
+                    if not conversion_success:
+                        logger.warning(f"Could not convert {col} to datetime, keeping as object")
             
             return df
             
