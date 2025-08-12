@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from config import model_config, data_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
-from transformer_model import create_ethos_model
+from ethos_model import create_small_ethos_model, SmallETHOSTransformer
 
 # Set up logging
 logging.basicConfig(
@@ -487,7 +487,7 @@ def main():
     if is_rank0:
         print("\n🏗️  Creating model...")
     try:
-        model = create_ethos_model(len(vocab))
+        model = create_small_ethos_model(len(vocab))
         model = model.to(device)
         if ddp:
             # Use static_graph to reduce collective overhead when graph is fixed
@@ -507,9 +507,58 @@ def main():
             model = torch.nn.DataParallel(model)
         if is_rank0:
             try:
-                print(f"✅ Model created with {model.module.count_parameters():,} parameters" if hasattr(model, 'module') else f"✅ Model created with {model.count_parameters():,} parameters")
+                num_params = model.module.count_parameters() if hasattr(model, 'module') else model.count_parameters()
+                print(f"✅ Model created with {num_params:,} parameters")
             except Exception:
                 print("✅ Model created")
+    except RuntimeError as e:
+        # Handle OOM at model init by retrying with a smaller config
+        oom = ('out of memory' in str(e).lower())
+        if oom:
+            if is_rank0:
+                print("⚠️ OOM during model creation. Retrying with smaller configuration (d_model=384, n_heads=6, d_ff=1536)...")
+            try:
+                model = SmallETHOSTransformer(
+                    vocab_size=len(vocab),
+                    d_model=384,
+                    n_heads=6,
+                    n_layers=6,
+                    d_ff=1536,
+                    max_seq_len=args.max_seq_len,
+                    dropout=model_config.dropout,
+                ).to(device)
+                if ddp:
+                    model = DDP(
+                        model,
+                        device_ids=[device.index] if device.type == 'cuda' else None,
+                        find_unused_parameters=False,
+                        gradient_as_bucket_view=True,
+                        static_graph=True,
+                    )
+                if is_rank0:
+                    try:
+                        num_params = model.module.count_parameters() if hasattr(model, 'module') else model.count_parameters()
+                        print(f"✅ Model created with {num_params:,} parameters (fallback)")
+                    except Exception:
+                        print("✅ Model created (fallback)")
+            except Exception as ee:
+                if is_rank0:
+                    print(f"❌ Error creating fallback model: {ee}")
+                if ddp and dist.is_initialized():
+                    try:
+                        dist.destroy_process_group()
+                    except Exception:
+                        pass
+                return
+        else:
+            if is_rank0:
+                print(f"❌ Error creating model: {e}")
+            if ddp and dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+            return
     except Exception as e:
         if is_rank0:
             print(f"❌ Error creating model: {e}")
