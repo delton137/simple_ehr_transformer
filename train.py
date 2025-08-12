@@ -355,6 +355,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
     parser.add_argument('--print_timeline_stats', action='store_true',
                        help='Print train/val patient counts and training timeline length histogram before training')
+    parser.add_argument('--print_random_timeline', action='store_true',
+                       help='Print a random patient timeline (decoded tokens) before training')
 
     args = parser.parse_args()
 
@@ -432,6 +434,23 @@ def main():
         if is_rank0:
             print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
             print(f"📚 Vocabulary size: {len(vocab)}")
+            # Optionally print a random patient timeline
+            if args.print_random_timeline and tokenized_timelines:
+                import random
+                id_to_token = {v: k for k, v in vocab.items()}
+                rand_pid = random.choice(list(tokenized_timelines.keys()))
+                seq = tokenized_timelines[rand_pid]
+                decoded = [id_to_token.get(t, f'UNKNOWN_{t}') for t in seq]
+                print("\n🧪 Random patient timeline:")
+                print(f"  Patient ID: {rand_pid}")
+                print(f"  Sequence length: {len(seq)}")
+                preview = 200
+                if len(decoded) > preview:
+                    print(f"  Tokens (first {preview}):")
+                    print("   ", decoded[:preview])
+                else:
+                    print("  Tokens:")
+                    print("   ", decoded)
     except Exception as e:
         if is_rank0:
             print(f"❌ Error loading data: {e}")

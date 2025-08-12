@@ -8,13 +8,14 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
+python train.py --tag aou_10days --data_dir $DATA_DIR --batch_size 8 --max_seq_len 512 --use_amp --num_workers 0
 
-torchrun --standalone --nproc_per_node=4 train.py \
-  --tag aou_10days \
-  --data_dir $DATA_DIR \
-  --batch_size 8 \
-  --grad_accum_steps 4 \
-  --max_seq_len 1024 \
-  --learning_rate 3e-4 \
-  --use_amp \
-  --num_workers 2
+#torchrun --standalone --nproc_per_node=4 train.py \
+#  --tag aou_10days \
+#  --data_dir $DATA_DIR \
+#  --batch_size 8 \
+#  --grad_accum_steps 4 \
+#  --max_seq_len 1024 \
+#  --learning_rate 3e-4 \
+#  --use_amp \
+#  --num_workers 2
