@@ -61,10 +61,15 @@ class MultiHeadAttention(nn.Module):
     def scaled_dot_product_attention(self, Q: torch.Tensor, K: torch.Tensor, 
                                    V: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute scaled dot-product attention"""
+        # Compute attention scores
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         
+        # Apply mask safely for mixed precision (fp16/bf16)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # Use the minimum finite value representable by the current dtype
+            # fp16 min is about -65504, so avoid -1e9 which overflows in half precision
+            neg_inf = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(mask == 0, neg_inf)
         
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
