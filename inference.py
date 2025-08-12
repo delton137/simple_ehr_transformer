@@ -274,112 +274,142 @@ class ETHOSInference:
 
 def main():
     """Main inference function"""
-    parser = argparse.ArgumentParser(description='Run inference with trained ETHOS model')
+    parser = argparse.ArgumentParser(description='Run ETHOS Transformer Inference')
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to trained model checkpoint')
-    parser.add_argument('--vocab_path', type=str, default='processed_data/vocabulary.pkl',
-                       help='Path to vocabulary file')
     parser.add_argument('--data_dir', type=str, default='processed_data',
-                       help='Directory containing processed data')
+                       help='Directory containing processed data (default: processed_data/)')
+    parser.add_argument('--tag', type=str, default=None,
+                       help='Dataset tag to use (e.g., aou_2023, mimic_iv)')
     parser.add_argument('--patient_id', type=int, default=None,
                        help='Specific patient ID to analyze')
     parser.add_argument('--output_dir', type=str, default='inference_results',
-                       help='Directory to save inference results')
-    parser.add_argument('--device', type=str, default='auto',
-                       help='Device to use (auto, cuda, cpu)')
+                       help='Directory for inference results (default: inference_results/)')
     
     args = parser.parse_args()
     
-    # Create output directory
+    # Handle tag-based data directory
+    if args.tag and not args.data_dir.startswith('processed_data_'):
+        args.data_dir = f"processed_data_{args.tag}"
+    
+    # Validate data directory
+    if not os.path.exists(args.data_dir):
+        print(f"❌ Error: Data directory '{args.data_dir}' does not exist!")
+        print(f"Available directories:")
+        available_dirs = [d for d in os.listdir('.') if d.startswith('processed_data')]
+        if available_dirs:
+            for d in available_dirs:
+                print(f"  - {d}")
+        else:
+            print("  - No processed_data directories found")
+        print(f"\nTo process data with a tag, run:")
+        print(f"  python data_processor.py --tag {args.tag or 'your_tag'}")
+        return
+    
+    # Create output directory with tag
+    if args.tag:
+        args.output_dir = f"inference_results_{args.tag}"
+    
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize inference engine
-    inference = ETHOSInference(args.model_path, args.vocab_path, args.device)
+    print(f"🔍 Starting ETHOS Transformer Inference")
+    print(f"📁 Data directory: {args.data_dir}")
+    print(f"🏷️  Dataset tag: {args.tag or 'none'}")
+    print(f"💾 Model: {args.model_path}")
+    print(f"📊 Output directory: {args.output_dir}")
     
-    # Load patient timelines
-    with open(os.path.join(args.data_dir, 'tokenized_timelines.pkl'), 'rb') as f:
-        tokenized_timelines = pickle.load(f)
+    # Load model and vocabulary
+    print("\n📚 Loading model and vocabulary...")
+    try:
+        inference = ETHOSInference(args.model_path, os.path.join(args.data_dir, 'vocabulary.pkl'))
+        print("✅ Model and vocabulary loaded successfully")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return
     
-    logger.info(f"Loaded {len(tokenized_timelines)} patient timelines")
+    # Load processed data
+    print("\n📊 Loading processed data...")
+    try:
+        with open(os.path.join(args.data_dir, 'tokenized_timelines.pkl'), 'rb') as f:
+            tokenized_timelines = pickle.load(f)
+        print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        return
     
-    # Analyze specific patient or random sample
-    if args.patient_id is not None:
-        if args.patient_id in tokenized_timelines:
-            patient_ids = [args.patient_id]
-        else:
-            logger.error(f"Patient ID {args.patient_id} not found!")
+    # Run inference
+    if args.patient_id:
+        # Analyze specific patient
+        print(f"\n🔍 Analyzing patient {args.patient_id}...")
+        if args.patient_id not in tokenized_timelines:
+            print(f"❌ Patient {args.patient_id} not found in dataset")
+            available_ids = list(tokenized_timelines.keys())[:10]
+            print(f"Available patient IDs (first 10): {available_ids}")
             return
-    else:
-        # Analyze a random sample of patients
-        patient_ids = np.random.choice(list(tokenized_timelines.keys()), 
-                                     size=min(5, len(tokenized_timelines)), 
-                                     replace=False)
-    
-    # Run inference on selected patients
-    results = {}
-    
-    for patient_id in patient_ids:
-        logger.info(f"Analyzing patient {patient_id}")
         
-        timeline = tokenized_timelines[patient_id]
-        
-        # Analyze current timeline
+        timeline = tokenized_timelines[args.patient_id]
         analysis = inference.analyze_patient_timeline(timeline)
         
+        # Save results
+        results_file = os.path.join(args.output_dir, f'patient_{args.patient_id}_analysis.json')
+        with open(results_file, 'w') as f:
+            json.dump(analysis, f, indent=2, default=str)
+        
+        print(f"✅ Analysis saved to: {results_file}")
+        print(f"\n📊 Analysis Results:")
+        for key, value in analysis.items():
+            if key != 'token_frequency':
+                print(f"  {key}: {value}")
+        
         # Generate future timeline
-        future_timeline = inference.generate_future_timeline(timeline)
+        print(f"\n🔮 Generating future timeline for patient {args.patient_id}...")
+        future_timeline = inference.generate_future_timeline(timeline, max_tokens=50)
         
-        # Store results
-        results[patient_id] = {
-            'analysis': analysis,
-            'original_timeline': timeline,
-            'future_timeline': future_timeline
-        }
+        future_file = os.path.join(args.output_dir, f'patient_{args.patient_id}_future_timeline.json')
+        with open(future_file, 'w') as f:
+            json.dump(future_timeline, f, indent=2, default=str)
         
-        # Visualize timeline
-        viz_path = os.path.join(args.output_dir, f'patient_{patient_id}_timeline.png')
-        inference.visualize_timeline(timeline, future_timeline, viz_path)
+        print(f"✅ Future timeline saved to: {future_file}")
         
-        # Print analysis
-        logger.info(f"Patient {patient_id} Analysis:")
-        logger.info(f"  Timeline length: {analysis['timeline_length']}")
-        logger.info(f"  Mortality probability: {analysis['mortality_probability']:.3f}")
-        logger.info(f"  Readmission probability: {analysis['readmission_probability']:.3f}")
-        if analysis['predicted_sofa'] is not None:
-            logger.info(f"  Predicted SOFA score: {analysis['predicted_sofa']}")
-        logger.info(f"  Predicted LOS: {analysis['predicted_los']:.1f} days")
+    else:
+        # Analyze all patients
+        print(f"\n🔍 Analyzing all {len(tokenized_timelines)} patients...")
+        
+        all_results = {}
+        for i, (patient_id, timeline) in enumerate(tokenized_timelines.items()):
+            if i % 100 == 0:
+                print(f"  Processing patient {i+1}/{len(tokenized_timelines)}...")
+            
+            try:
+                analysis = inference.analyze_patient_timeline(timeline)
+                all_results[patient_id] = analysis
+            except Exception as e:
+                print(f"⚠️  Error analyzing patient {patient_id}: {e}")
+                continue
+        
+        # Save all results
+        all_results_file = os.path.join(args.output_dir, 'all_patients_analysis.json')
+        with open(all_results_file, 'w') as f:
+            json.dump(all_results, f, indent=2, default=str)
+        
+        print(f"✅ All results saved to: {all_results_file}")
+        
+        # Summary statistics
+        if all_results:
+            mortality_probs = [r['mortality_probability'] for r in all_results.values() if 'mortality_probability' in r]
+            readmission_probs = [r['readmission_probability'] for r in all_results.values() if 'readmission_probability' in r]
+            los_predictions = [r['predicted_los'] for r in all_results.values() if 'predicted_los' in r]
+            
+            print(f"\n📊 Summary Statistics:")
+            if mortality_probs:
+                print(f"  Mortality probability - Mean: {np.mean(mortality_probs):.3f}, Std: {np.std(mortality_probs):.3f}")
+            if readmission_probs:
+                print(f"  Readmission probability - Mean: {np.mean(readmission_probs):.3f}, Std: {np.std(readmission_probs):.3f}")
+            if los_predictions:
+                print(f"  Predicted LOS - Mean: {np.mean(los_predictions):.1f} days, Std: {np.std(los_predictions):.1f} days")
     
-    # Save results
-    results_path = os.path.join(args.output_dir, 'inference_results.json')
-    
-    # Convert numpy types to native Python types for JSON serialization
-    def convert_numpy_types(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {k: convert_numpy_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_numpy_types(v) for v in obj]
-        return obj
-    
-    serializable_results = convert_numpy_types(results)
-    
-    with open(results_path, 'w') as f:
-        json.dump(serializable_results, f, indent=2)
-    
-    logger.info(f"Inference results saved to {results_path}")
-    
-    # Summary statistics
-    mortality_probs = [r['analysis']['mortality_probability'] for r in results.values()]
-    readmission_probs = [r['analysis']['readmission_probability'] for r in results.values()]
-    
-    logger.info(f"\nSummary Statistics:")
-    logger.info(f"  Average mortality probability: {np.mean(mortality_probs):.3f}")
-    logger.info(f"  Average readmission probability: {np.mean(readmission_probs):.3f}")
+    print(f"\n🎉 Inference completed!")
+    print(f"📁 Results saved to: {args.output_dir}/")
 
 if __name__ == "__main__":
     main()

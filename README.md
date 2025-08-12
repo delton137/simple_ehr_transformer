@@ -70,52 +70,131 @@ python data_processor.py
 # Specify custom OMOP data path
 python data_processor.py --data_path /path/to/your/omop_data
 
+# Use dataset tag for isolation (recommended for multiple datasets)
+python data_processor.py --data_path /path/to/omop_data --tag aou_2023
+
 # Specify custom output directory
 python data_processor.py --data_path /path/to/omop_data --output_dir /path/to/output
 
 # Adjust memory limit for large datasets
 python data_processor.py --data_path /path/to/omop_data --memory_limit 16.0
+
+# Force reprocessing (useful for debugging)
+python data_processor.py --data_path /path/to/omop_data --tag aou_2023 --force_reprocess
 ```
 
 **Command line options:**
 - `--data_path`: Path to OMOP data directory (default: `omop_data/`)
-- `--output_dir`: Output directory for processed data (default: `processed_data/`)
+- `--tag`: Dataset tag for isolating different datasets (e.g., `aou_2023`, `mimic_iv`, `eicu`)
+- `--output_dir`: Output directory for processed data (default: `processed_data/` or `processed_data_{tag}/`)
 - `--memory_limit`: Memory limit in GB (default: 8.0)
+- `--force_reprocess`: Force reprocessing even if data exists
 
-This will:
-- Load OMOP data from the specified directory
-- Create patient timelines
-- Tokenize events and measurements
-- Build vocabulary
-- Save processed data to the output directory
+**Dataset Isolation with Tags:**
+The tag system allows you to work with multiple datasets simultaneously:
+
+```bash
+# Process All of Us 2023 data
+python data_processor.py --data_path ~/omop_data_2023 --tag aou_2023
+
+# Process MIMIC-IV data
+python data_processor.py --data_path ~/mimic_iv --tag mimic_iv
+
+# Process eICU data
+python data_processor.py --data_path ~/eicu --tag eicu
+```
+
+This creates separate directories:
+- `processed_data_aou_2023/` - All of Us 2023 processed data
+- `processed_data_mimic_iv/` - MIMIC-IV processed data  
+- `processed_data_eicu/` - eICU processed data
 
 ### 2. Training
 
 Train the ETHOS transformer model:
 
 ```bash
+# Train with default data directory
 python train.py --batch_size 32 --max_epochs 100 --learning_rate 3e-4
+
+# Train with tagged dataset
+python train.py --tag aou_2023 --batch_size 32 --max_epochs 100
+
+# Train with custom data directory
+python train.py --data_dir processed_data_aou_2023 --batch_size 32
 ```
 
 Training options:
+- `--tag`: Dataset tag to use (automatically finds `processed_data_{tag}/`)
+- `--data_dir`: Directory containing processed data (default: `processed_data/`)
 - `--batch_size`: Training batch size (default: 32)
 - `--max_epochs`: Maximum training epochs (default: 100)
 - `--learning_rate`: Learning rate (default: 3e-4)
 - `--device`: Device to use (auto/cuda/cpu, default: auto)
 - `--resume`: Resume from checkpoint
 
+**Tag-based Training:**
+```bash
+# Train on All of Us 2023 data
+python train.py --tag aou_2023 --batch_size 64 --max_epochs 200
+
+# Train on MIMIC-IV data  
+python train.py --tag mimic_iv --batch_size 32 --max_epochs 100
+
+# Models are saved to separate directories:
+# - models_aou_2023/
+# - models_mimic_iv/
+```
+
 ### 3. Inference
 
 Run inference with the trained model:
 
 ```bash
+# Basic inference
 python inference.py --model_path models/best_checkpoint.pth --patient_id 12345
+
+# Inference with tagged dataset
+python inference.py --tag aou_2023 --model_path models_aou_2023/best_checkpoint.pth
+
+# Inference with custom data directory
+python inference.py --model_path models/best_checkpoint.pth --data_dir processed_data_aou_2023
 ```
 
 Inference options:
+- `--tag`: Dataset tag to use (automatically finds `processed_data_{tag}/`)
 - `--model_path`: Path to trained model checkpoint
+- `--data_dir`: Directory containing processed data (default: `processed_data/`)
 - `--patient_id`: Specific patient ID to analyze (optional)
-- `--output_dir`: Directory for inference results (default: inference_results)
+- `--output_dir`: Directory for inference results (default: `inference_results/` or `inference_results_{tag}/`)
+
+**Tag-based Inference:**
+```bash
+# Analyze All of Us 2023 patients
+python inference.py --tag aou_2023 --model_path models_aou_2023/best_checkpoint.pth
+
+# Analyze MIMIC-IV patients
+python inference.py --tag mimic_iv --model_path models_mimic_iv/best_checkpoint.pth
+
+# Results are saved to separate directories:
+# - inference_results_aou_2023/
+# - inference_results_mimic_iv/
+```
+
+### 4. Example Workflow
+
+Run the complete workflow example:
+
+```bash
+# Basic workflow
+python example_workflow.py --data_path ~/omop_data
+
+# Workflow with dataset tag
+python example_workflow.py --data_path ~/omop_data_2023 --tag aou_2023
+
+# Workflow with custom memory limit
+python example_workflow.py --data_path ~/omop_data --tag aou_2023 --memory_limit 16.0
+```
 
 ## Model Architecture
 

@@ -26,13 +26,21 @@ def main():
                        help='Output directory for processed data (default: processed_data/)')
     parser.add_argument('--memory_limit', type=float, default=8.0,
                        help='Memory limit in GB (default: 8.0)')
+    parser.add_argument('--tag', type=str, default=None,
+                       help='Dataset tag for isolating different datasets (e.g., aou_2023, mimic_iv)')
     
     args = parser.parse_args()
+    
+    # Handle tag-based output directory
+    if args.tag and not args.output_dir.startswith('processed_data_'):
+        args.output_dir = f"processed_data_{args.tag}"
     
     logger.info("=== ETHOS Transformer Workflow Example ===")
     logger.info(f"OMOP Data Path: {args.data_path}")
     logger.info(f"Output Directory: {args.output_dir}")
     logger.info(f"Memory Limit: {args.memory_limit} GB")
+    if args.tag:
+        logger.info(f"Dataset Tag: {args.tag}")
     
     # Step 1: Data Processing
     logger.info("\n1. Processing OMOP Data...")
@@ -131,7 +139,10 @@ def main():
     if skip_training:
         logger.info("Skipping training for demo purposes")
         logger.info("To train the model, run:")
-        logger.info(f"  python train.py --data_dir {args.output_dir}")
+        if args.tag:
+            logger.info(f"  python train.py --tag {args.tag}")
+        else:
+            logger.info(f"  python train.py --data_dir {args.output_dir}")
     else:
         try:
             # This would start the actual training
@@ -154,7 +165,8 @@ def main():
     
     try:
         # Check if we have a trained model
-        model_paths = ['models/best_checkpoint.pth', 'models/latest_checkpoint.pth']
+        model_dir = f"models_{args.tag}" if args.tag else "models"
+        model_paths = [f'{model_dir}/best_checkpoint.pth', f'{model_dir}/latest_checkpoint.pth']
         model_path = None
         
         for path in model_paths:
@@ -198,7 +210,10 @@ def main():
         else:
             logger.info("No trained model found")
             logger.info("To run inference, first train a model using:")
-            logger.info(f"  python train.py --data_dir {args.output_dir}")
+            if args.tag:
+                logger.info(f"  python train.py --tag {args.tag}")
+            else:
+                logger.info(f"  python train.py --data_dir {args.output_dir}")
             
     except Exception as e:
         logger.error(f"Inference failed: {e}")
@@ -222,9 +237,14 @@ def main():
         logger.info("⚠ Inference skipped (no trained model)")
     
     logger.info("\nNext Steps:")
-    logger.info(f"1. To train the model: python train.py --data_dir {args.output_dir}")
-    logger.info("2. To run inference: python inference.py --model_path models/best_checkpoint.pth")
-    logger.info("3. To analyze specific patients: python inference.py --patient_id <ID>")
+    if args.tag:
+        logger.info(f"1. To train the model: python train.py --tag {args.tag}")
+        logger.info(f"2. To run inference: python inference.py --tag {args.tag} --model_path {model_dir}/best_checkpoint.pth")
+        logger.info(f"3. To analyze specific patients: python inference.py --tag {args.tag} --patient_id <ID>")
+    else:
+        logger.info(f"1. To train the model: python train.py --data_dir {args.output_dir}")
+        logger.info("2. To run inference: python inference.py --model_path models/best_checkpoint.pth")
+        logger.info("3. To analyze specific patients: python inference.py --patient_id <ID>")
     
     logger.info("\n=== Workflow Complete ===")
 

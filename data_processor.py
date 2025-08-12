@@ -784,12 +784,19 @@ def main():
                        help='Output directory for processed data (default: processed_data/)')
     parser.add_argument('--memory_limit', type=float, default=None,
                        help='Memory limit in GB (default: 8.0)')
+    parser.add_argument('--force_reprocess', action='store_true',
+                       help='Force reprocessing even if data exists')
+    parser.add_argument('--tag', type=str, default=None,
+                       help='Dataset tag for isolating different datasets (e.g., aou_2023, mimic_iv)')
     
     args = parser.parse_args()
     
     # Override config values if provided
     if args.output_dir:
         data_config.output_dir = args.output_dir
+    elif args.tag:
+        # Use tag-based output directory
+        data_config.output_dir = f"processed_data_{args.tag}"
     
     if args.memory_limit:
         data_config.memory_limit_gb = args.memory_limit
@@ -800,8 +807,23 @@ def main():
     # Initialize processor with custom data path
     processor = OMOPDataProcessor(data_path=args.data_path)
     
-    # Process data if not already processed
-    if not os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
+    # Check if we should reprocess
+    should_reprocess = args.force_reprocess
+    
+    # Check if existing data is valid (has patients)
+    if not should_reprocess and os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
+        try:
+            with open(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl'), 'rb') as f:
+                existing_data = pickle.load(f)
+            if len(existing_data) == 0:
+                logger.info("Existing processed data has 0 patients, forcing reprocessing...")
+                should_reprocess = True
+        except Exception as e:
+            logger.warning(f"Error checking existing data: {e}, forcing reprocessing...")
+            should_reprocess = True
+    
+    # Process data if needed
+    if should_reprocess or not os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
         logger.info("Processing new OMOP data...")
         tokenized_timelines, vocab = processor.process_all_data()
     else:
@@ -811,6 +833,21 @@ def main():
     print(f"Processed {len(tokenized_timelines)} patient timelines")
     print(f"Vocabulary size: {len(vocab)}")
     print(f"Data saved to: {data_config.output_dir}")
+    
+    # Warn if still 0 patients
+    if len(tokenized_timelines) == 0:
+        print("\n⚠️  WARNING: No patients were processed!")
+        print("This could indicate:")
+        print("1. Data directory structure is incorrect")
+        print("2. Parquet files are empty or corrupted")
+        print("3. Column names don't match expected OMOP format")
+        print("\nTry running with --force_reprocess to see detailed logs")
+    
+    # Show tag information
+    if args.tag:
+        print(f"\n📁 Dataset tag: {args.tag}")
+        print(f"📁 Output directory: {data_config.output_dir}")
+        print(f"💡 To use this dataset in other scripts, use: --data_dir {data_config.output_dir}")
 
 if __name__ == "__main__":
     main()

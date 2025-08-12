@@ -269,21 +269,50 @@ class ETHOSTrainer:
 
 def main():
     """Main training function"""
-    parser = argparse.ArgumentParser(description='Train ETHOS transformer model')
+    parser = argparse.ArgumentParser(description='Train ETHOS Transformer Model')
     parser.add_argument('--data_dir', type=str, default='processed_data',
-                       help='Directory containing processed data')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
+                       help='Directory containing processed data (default: processed_data/)')
+    parser.add_argument('--tag', type=str, default=None,
+                       help='Dataset tag to use (e.g., aou_2023, mimic_iv)')
     parser.add_argument('--batch_size', type=int, default=32,
-                       help='Training batch size')
+                       help='Training batch size (default: 32)')
     parser.add_argument('--max_epochs', type=int, default=100,
-                       help='Maximum number of training epochs')
+                       help='Maximum training epochs (default: 100)')
     parser.add_argument('--learning_rate', type=float, default=3e-4,
-                       help='Learning rate')
+                       help='Learning rate (default: 3e-4)')
     parser.add_argument('--device', type=str, default='auto',
-                       help='Device to use (auto, cuda, cpu)')
+                       choices=['auto', 'cuda', 'cpu'],
+                       help='Device to use (default: auto)')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume training from checkpoint')
     
     args = parser.parse_args()
+    
+    # Handle tag-based data directory
+    if args.tag and not args.data_dir.startswith('processed_data_'):
+        args.data_dir = f"processed_data_{args.tag}"
+    
+    # Validate data directory
+    if not os.path.exists(args.data_dir):
+        print(f"❌ Error: Data directory '{args.data_dir}' does not exist!")
+        print(f"Available directories:")
+        available_dirs = [d for d in os.listdir('.') if d.startswith('processed_data')]
+        if available_dirs:
+            for d in available_dirs:
+                print(f"  - {d}")
+        else:
+            print("  - No processed_data directories found")
+        print(f"\nTo process data with a tag, run:")
+        print(f"  python data_processor.py --tag {args.tag or 'your_tag'}")
+        return
+    
+    print(f"🚀 Starting ETHOS Transformer Training")
+    print(f"📁 Data directory: {args.data_dir}")
+    if args.tag:
+        print(f"🏷️  Dataset tag: {args.tag}")
+    print(f"⚙️  Batch size: {args.batch_size}")
+    print(f"📈 Max epochs: {args.max_epochs}")
+    print(f"📚 Learning rate: {args.learning_rate}")
     
     # Set device
     if args.device == 'auto':
@@ -291,64 +320,118 @@ def main():
     else:
         device = torch.device(args.device)
     
-    logger.info(f"Using device: {device}")
+    print(f"💻 Device: {device}")
     
-    # Load processed data
-    logger.info("Loading processed data...")
-    
-    data_path = Path(args.data_dir)
-    if not data_path.exists():
-        logger.error(f"Data directory {args.data_dir} does not exist!")
-        logger.info("Please run data_processor.py first to process your EHR data.")
+    # Load data
+    print("\n📊 Loading data...")
+    try:
+        tokenized_timelines, vocab = load_processed_data(args.data_dir)
+        print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
+        print(f"📚 Vocabulary size: {len(vocab)}")
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
         return
     
-    # Load tokenized timelines and vocabulary
-    with open(data_path / 'tokenized_timelines.pkl', 'rb') as f:
-        tokenized_timelines = pickle.load(f)
-    
-    with open(data_path / 'vocabulary.pkl', 'rb') as f:
-        vocab = pickle.load(f)
-    
-    logger.info(f"Loaded {len(tokenized_timelines)} patient timelines")
-    logger.info(f"Vocabulary size: {len(vocab)}")
-    
-    # Analyze data distribution
-    analysis = analyze_data_distribution(tokenized_timelines)
-    logger.info("Data Analysis:")
-    for key, value in analysis.items():
-        if key != 'token_frequency':
-            logger.info(f"  {key}: {value}")
-    
     # Create data loaders
-    logger.info("Creating data loaders...")
-    processor = PHTDataProcessor(tokenized_timelines, len(vocab))
-    train_loader, val_loader = processor.create_dataloaders(
-        batch_size=args.batch_size,
-        num_workers=4
-    )
-    
-    logger.info(f"Training batches: {len(train_loader)}")
-    logger.info(f"Validation batches: {len(val_loader)}")
+    print("\n🔧 Creating data loaders...")
+    try:
+        data_processor = PHTDataProcessor(tokenized_timelines, len(vocab))
+        train_loader, val_loader = data_processor.create_dataloaders(batch_size=args.batch_size)
+        print(f"✅ Training batches: {len(train_loader)}")
+        print(f"✅ Validation batches: {len(val_loader)}")
+    except Exception as e:
+        print(f"❌ Error creating data loaders: {e}")
+        return
     
     # Create model
-    logger.info("Creating ETHOS model...")
-    model = create_ethos_model(len(vocab))
-    model = model.to(device)
+    print("\n🏗️  Creating model...")
+    try:
+        model = create_ethos_model(len(vocab))
+        model = model.to(device)
+        print(f"✅ Model created with {model.count_parameters():,} parameters")
+    except Exception as e:
+        print(f"❌ Error creating model: {e}")
+        return
     
-    # Update config with command line arguments
-    config = {
-        'batch_size': args.batch_size,
-        'max_epochs': args.max_epochs,
-        'learning_rate': args.learning_rate,
-        'gradient_clip': model_config.gradient_clip,
-        'warmup_steps': model_config.warmup_steps
-    }
-    
-    # Create trainer
-    trainer = ETHOSTrainer(model, train_loader, val_loader, device, config)
-    
-    # Start training
-    trainer.train(resume_from=args.resume)
+    # Setup training
+    print("\n⚙️  Setting up training...")
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs)
+        criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
+        
+        # Create model directory with tag
+        model_dir = f"models_{args.tag}" if args.tag else "models"
+        os.makedirs(model_dir, exist_ok=True)
+        
+        # Training loop
+        print(f"\n🎯 Starting training for {args.max_epochs} epochs...")
+        print(f"💾 Models will be saved to: {model_dir}/")
+        
+        best_val_loss = float('inf')
+        start_epoch = 0
+        
+        # Resume from checkpoint if specified
+        if args.resume:
+            if os.path.exists(args.resume):
+                checkpoint = torch.load(args.resume, map_location=device)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint['best_val_loss']
+                print(f"✅ Resumed from checkpoint: {args.resume}")
+                print(f"📅 Starting from epoch: {start_epoch}")
+            else:
+                print(f"⚠️  Checkpoint not found: {args.resume}")
+                print("Starting training from scratch...")
+        
+        # Training loop
+        for epoch in range(start_epoch, args.max_epochs):
+            # Training
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+            
+            # Validation
+            val_loss = validate_epoch(model, val_loader, criterion, device)
+            
+            # Learning rate scheduling
+            scheduler.step()
+            
+            # Logging
+            print(f"Epoch {epoch+1:3d}/{args.max_epochs} | "
+                  f"Train Loss: {train_loss:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | "
+                  f"LR: {scheduler.get_last_lr()[0]:.6f}")
+            
+            # Save checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_loss': best_val_loss,
+                'vocab_size': len(vocab),
+                'config': model_config
+            }
+            
+            # Save latest checkpoint
+            torch.save(checkpoint, os.path.join(model_dir, 'latest_checkpoint.pth'))
+            
+            # Save best checkpoint
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(checkpoint, os.path.join(model_dir, 'best_checkpoint.pth'))
+                print(f"💾 New best model saved! (Val Loss: {val_loss:.4f})")
+        
+        print(f"\n🎉 Training completed!")
+        print(f"💾 Best model saved to: {model_dir}/best_checkpoint.pth")
+        print(f"💾 Latest model saved to: {model_dir}/latest_checkpoint.pth")
+        
+    except Exception as e:
+        print(f"❌ Training error: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
 if __name__ == "__main__":
     main()
