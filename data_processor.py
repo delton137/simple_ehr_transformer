@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Data processor for converting OMOP data to tokenized Patient Health Timelines (PHTs)
 Optimized for large datasets (several GB) with memory management and chunked processing
@@ -20,6 +21,7 @@ import multiprocessing as mp
 from pathlib import Path
 import tempfile
 import shutil
+import argparse
 
 from config import data_config, token_config, model_config
 
@@ -30,13 +32,19 @@ logger = logging.getLogger(__name__)
 class OMOPDataProcessor:
     """Process large OMOP datasets with memory optimization"""
     
-    def __init__(self):
+    def __init__(self, data_path: str = None):
         self.vocab = {}
         self.vocab_size = 0
         self.quantile_mappings = {}
         self.age_mappings = {}
         self.time_interval_mappings = {}
         self.static_mappings = {}
+        
+        # Override data path if provided
+        if data_path:
+            self.omop_data_dir = data_path
+        else:
+            self.omop_data_dir = data_config.omop_data_dir
         
         # Memory monitoring
         self.memory_limit_bytes = data_config.memory_limit_gb * 1024**3
@@ -53,7 +61,7 @@ class OMOPDataProcessor:
     
     def load_omop_data_chunked(self, table_name: str) -> Iterator[pd.DataFrame]:
         """Load OMOP table data in chunks to manage memory"""
-        table_dir = os.path.join(data_config.omop_data_dir, table_name)
+        table_dir = os.path.join(self.omop_data_dir, table_name)
         
         if not os.path.exists(table_dir):
             logger.warning(f"Table directory {table_dir} does not exist")
@@ -646,6 +654,7 @@ class OMOPDataProcessor:
     def process_all_data(self) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
         """Process all OMOP data and return tokenized timelines and vocabulary"""
         logger.info("Processing all OMOP data...")
+        logger.info(f"Data directory: {self.omop_data_dir}")
         logger.info(f"Memory limit: {data_config.memory_limit_gb:.1f} GB")
         
         # Step 1: Process person table (demographics)
@@ -756,15 +765,42 @@ class OMOPDataProcessor:
         logger.info(f"Loaded processed data: {len(tokenized_timelines)} patients, {self.vocab_size} tokens")
         return tokenized_timelines, self.vocab
 
-if __name__ == "__main__":
-    # Example usage
-    processor = OMOPDataProcessor()
+def main():
+    """Main function with command line argument parsing"""
+    parser = argparse.ArgumentParser(description='Process OMOP data into tokenized Patient Health Timelines')
+    parser.add_argument('--data_path', type=str, default=None,
+                       help='Path to OMOP data directory (default: omop_data/)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='Output directory for processed data (default: processed_data/)')
+    parser.add_argument('--memory_limit', type=float, default=None,
+                       help='Memory limit in GB (default: 8.0)')
+    
+    args = parser.parse_args()
+    
+    # Override config values if provided
+    if args.output_dir:
+        data_config.output_dir = args.output_dir
+    
+    if args.memory_limit:
+        data_config.memory_limit_gb = args.memory_limit
+    
+    # Create output directory
+    os.makedirs(data_config.output_dir, exist_ok=True)
+    
+    # Initialize processor with custom data path
+    processor = OMOPDataProcessor(data_path=args.data_path)
     
     # Process data if not already processed
     if not os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
+        logger.info("Processing new OMOP data...")
         tokenized_timelines, vocab = processor.process_all_data()
     else:
+        logger.info("Loading existing processed data...")
         tokenized_timelines, vocab = processor.load_processed_data()
     
     print(f"Processed {len(tokenized_timelines)} patient timelines")
     print(f"Vocabulary size: {len(vocab)}")
+    print(f"Data saved to: {data_config.output_dir}")
+
+if __name__ == "__main__":
+    main()

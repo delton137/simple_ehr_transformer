@@ -2,12 +2,14 @@
 """
 Example workflow demonstrating the complete ETHOS pipeline
 From data processing to training to inference
+Optimized for large OMOP datasets
 """
 
 import os
 import logging
 import pickle
 from pathlib import Path
+import argparse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -16,23 +18,37 @@ logger = logging.getLogger(__name__)
 def main():
     """Demonstrate the complete ETHOS workflow"""
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='ETHOS Transformer Workflow Example')
+    parser.add_argument('--data_path', type=str, default='omop_data',
+                       help='Path to OMOP data directory (default: omop_data/)')
+    parser.add_argument('--output_dir', type=str, default='processed_data',
+                       help='Output directory for processed data (default: processed_data/)')
+    parser.add_argument('--memory_limit', type=float, default=8.0,
+                       help='Memory limit in GB (default: 8.0)')
+    
+    args = parser.parse_args()
+    
     logger.info("=== ETHOS Transformer Workflow Example ===")
+    logger.info(f"OMOP Data Path: {args.data_path}")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info(f"Memory Limit: {args.memory_limit} GB")
     
     # Step 1: Data Processing
-    logger.info("\n1. Processing EHR Data...")
+    logger.info("\n1. Processing OMOP Data...")
     
     try:
-        from data_processor import EHRDataProcessor
+        from data_processor import OMOPDataProcessor
         
-        # Initialize processor
-        processor = EHRDataProcessor()
+        # Initialize processor with custom data path
+        processor = OMOPDataProcessor(data_path=args.data_path)
         
         # Check if data already exists
-        if os.path.exists('processed_data/tokenized_timelines.pkl'):
+        if os.path.exists(os.path.join(args.output_dir, 'tokenized_timelines.pkl')):
             logger.info("Loading existing processed data...")
             tokenized_timelines, vocab = processor.load_processed_data()
         else:
-            logger.info("Processing new data...")
+            logger.info("Processing new OMOP data...")
             tokenized_timelines, vocab = processor.process_all_data()
         
         logger.info(f"✓ Processed {len(tokenized_timelines)} patient timelines")
@@ -40,7 +56,16 @@ def main():
         
     except Exception as e:
         logger.error(f"Data processing failed: {e}")
-        logger.info("Please ensure your OMOP/MEDS data is in the correct directories")
+        logger.info(f"Please ensure your OMOP data is in the correct directory: {args.data_path}")
+        logger.info("Expected structure:")
+        logger.info("  - person/ (with parquet files)")
+        logger.info("  - visit_occurrence/ (with parquet files)")
+        logger.info("  - condition_occurrence/ (with parquet files)")
+        logger.info("  - drug_exposure/ (with parquet files)")
+        logger.info("  - procedure_occurrence/ (with parquet files)")
+        logger.info("  - measurement/ (with parquet files)")
+        logger.info("  - observation/ (with parquet files)")
+        logger.info("  - death/ (with parquet files)")
         return
     
     # Step 2: Data Analysis
@@ -105,7 +130,8 @@ def main():
     
     if skip_training:
         logger.info("Skipping training for demo purposes")
-        logger.info("To train the model, run: python train.py")
+        logger.info("To train the model, run:")
+        logger.info(f"  python train.py --data_dir {args.output_dir}")
     else:
         try:
             # This would start the actual training
@@ -142,7 +168,7 @@ def main():
             from inference import ETHOSInference
             
             # Initialize inference
-            inference = ETHOSInference(model_path, 'processed_data/vocabulary.pkl')
+            inference = ETHOSInference(model_path, f'{args.output_dir}/vocabulary.pkl')
             
             # Select a patient for demo
             patient_ids = list(tokenized_timelines.keys())
@@ -171,7 +197,8 @@ def main():
                 
         else:
             logger.info("No trained model found")
-            logger.info("To run inference, first train a model using: python train.py")
+            logger.info("To run inference, first train a model using:")
+            logger.info(f"  python train.py --data_dir {args.output_dir}")
             
     except Exception as e:
         logger.error(f"Inference failed: {e}")
@@ -195,7 +222,7 @@ def main():
         logger.info("⚠ Inference skipped (no trained model)")
     
     logger.info("\nNext Steps:")
-    logger.info("1. To train the model: python train.py")
+    logger.info(f"1. To train the model: python train.py --data_dir {args.output_dir}")
     logger.info("2. To run inference: python inference.py --model_path models/best_checkpoint.pth")
     logger.info("3. To analyze specific patients: python inference.py --patient_id <ID>")
     

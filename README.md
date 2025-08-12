@@ -1,6 +1,6 @@
 # ETHOS Transformer for EHR Data
 
-This repository implements an ETHOS-like transformer model for Electronic Health Record (EHR) data, based on the paper "Zero shot health trajectory prediction using transformer" by Renc et al. The implementation provides a complete pipeline for processing OMOP and MEDS format EHR data, training a transformer model, and performing zero-shot inference.
+This repository implements an ETHOS-like transformer model for Electronic Health Record (EHR) data, based on the paper "Zero shot health trajectory prediction using transformer" by Renc et al. The implementation provides a complete pipeline for processing OMOP format EHR data, training a transformer model, and performing zero-shot inference.
 
 ## Overview
 
@@ -8,7 +8,8 @@ ETHOS (Enhanced Transformer for Health Outcome Simulation) is a novel applicatio
 
 ## Features
 
-- **Data Processing**: Convert OMOP and MEDS format EHR data to tokenized Patient Health Timelines
+- **Data Processing**: Convert OMOP format EHR data to tokenized Patient Health Timelines
+- **Large Dataset Optimization**: Memory management and chunked processing for datasets several GB in size
 - **Transformer Model**: Implementation of ETHOS architecture with learnable positional encodings
 - **Training Pipeline**: Complete training script with validation, checkpointing, and visualization
 - **Zero-shot Inference**: Predict mortality, readmission, SOFA scores, and length of stay without task-specific training
@@ -30,15 +31,15 @@ pip install -r requirements.txt
 
 3. Create necessary directories:
 ```bash
-mkdir -p omop_data meds_data processed_data models logs plots
+mkdir -p processed_data models logs plots
 ```
 
 ## Data Preparation
 
 ### OMOP Format
-Place your OMOP data in the `omop_data/` directory with the following structure:
+Place your OMOP data in a directory with the following structure:
 ```
-omop_data/
+your_omop_data/
 ├── person/
 │   ├── part_0.parquet
 │   ├── part_1.parquet
@@ -54,25 +55,39 @@ omop_data/
 └── death/
 ```
 
-### MEDS Format
-Place your MEDS data in the `meds_data/` directory as parquet files containing event data with columns like `patient_id`, `timestamp`, `event_type`, etc.
+**Note**: The code expects parquet files organized in subdirectories by table name. Each table subdirectory should contain one or more parquet files.
 
 ## Usage
 
 ### 1. Data Processing
 
-First, process your EHR data to create tokenized Patient Health Timelines:
+First, process your OMOP data to create tokenized Patient Health Timelines:
 
 ```bash
+# Use default path (omop_data/)
 python data_processor.py
+
+# Specify custom OMOP data path
+python data_processor.py --data_path /path/to/your/omop_data
+
+# Specify custom output directory
+python data_processor.py --data_path /path/to/omop_data --output_dir /path/to/output
+
+# Adjust memory limit for large datasets
+python data_processor.py --data_path /path/to/omop_data --memory_limit 16.0
 ```
 
+**Command line options:**
+- `--data_path`: Path to OMOP data directory (default: `omop_data/`)
+- `--output_dir`: Output directory for processed data (default: `processed_data/`)
+- `--memory_limit`: Memory limit in GB (default: 8.0)
+
 This will:
-- Load OMOP and MEDS data
+- Load OMOP data from the specified directory
 - Create patient timelines
 - Tokenize events and measurements
 - Build vocabulary
-- Save processed data to `processed_data/`
+- Save processed data to the output directory
 
 ### 2. Training
 
@@ -125,6 +140,12 @@ class ModelConfig:
     d_ff: int = 3072           # Feed-forward dimension
     max_seq_len: int = 2048    # Maximum sequence length
     dropout: float = 0.1       # Dropout rate
+
+@dataclass
+class DataConfig:
+    chunk_size: int = 10000     # Process data in chunks
+    max_patients_per_chunk: int = 5000  # Max patients in memory
+    memory_limit_gb: float = 8.0        # Memory limit for processing
 ```
 
 ## Tokenization Strategy
@@ -137,11 +158,21 @@ The implementation uses a sophisticated tokenization approach:
 4. **Time Interval Tokens**: Temporal gaps between events (5m, 15m, 1h, 1d, etc.)
 5. **Static Tokens**: Patient demographics, age intervals, birth year
 
+## Large Dataset Optimization
+
+The code is specifically optimized for large OMOP datasets:
+
+- **Chunked Processing**: Data is processed in manageable chunks to control memory usage
+- **Memory Monitoring**: Real-time memory usage tracking with configurable limits
+- **Garbage Collection**: Automatic memory cleanup between processing steps
+- **Parallel Processing**: Support for multiprocessing when available
+- **Streaming**: Processes parquet files without loading entire tables into memory
+
 ## Training Process
 
 The training follows the ETHOS methodology:
 
-1. **Data Preparation**: Convert EHR data to chronological patient timelines
+1. **Data Preparation**: Convert OMOP data to chronological patient timelines
 2. **Tokenization**: Transform events into token sequences
 3. **Sequence Modeling**: Train transformer to predict next tokens
 4. **Zero-shot Learning**: Model learns to generate future health trajectories
@@ -159,12 +190,12 @@ The trained model can perform zero-shot predictions:
 ## Example Workflow
 
 ```python
-from data_processor import EHRDataProcessor
+from data_processor import OMOPDataProcessor
 from transformer_model import create_ethos_model
 from inference import ETHOSInference
 
-# 1. Process data
-processor = EHRDataProcessor()
+# 1. Process data with custom path
+processor = OMOPDataProcessor(data_path="/path/to/omop_data")
 tokenized_timelines, vocab = processor.process_all_data()
 
 # 2. Create and train model
@@ -193,12 +224,13 @@ The pipeline generates several output files:
 - **Batch Size**: Adjust based on available memory
 - **Sequence Length**: Longer sequences require more memory and computation
 - **Data Size**: Larger datasets improve model performance but increase training time
+- **Chunk Size**: Adjust chunk size based on available RAM
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Out of Memory**: Reduce batch size or sequence length
+1. **Out of Memory**: Reduce batch size, sequence length, or chunk size
 2. **Data Loading Errors**: Check file paths and parquet file integrity
 3. **Training Divergence**: Reduce learning rate or increase gradient clipping
 4. **Slow Training**: Use GPU acceleration and optimize data loading
@@ -209,6 +241,14 @@ The pipeline generates several output files:
 - Enable mixed precision training for faster GPU training
 - Use multiple workers for data loading
 - Monitor GPU memory usage during training
+- Adjust memory limits based on your system
+
+### Large Dataset Tips
+
+- Start with smaller chunks and increase gradually
+- Monitor memory usage during processing
+- Use `--memory_limit` to set appropriate limits for your system
+- Process data on machines with sufficient RAM
 
 ## Citation
 
