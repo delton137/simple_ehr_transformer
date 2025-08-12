@@ -128,15 +128,22 @@ class OMOPDataProcessor:
         # Collect lazily (streaming) then write partitioned with PyArrow dataset API
         try:
             tbl = events_lazy.collect().to_arrow()
+            import pyarrow as pa
+            import pyarrow.compute as pc
             import pyarrow.dataset as pds
+            # Add a bucket column to limit number of partitions
+            # 1024 buckets keeps directory fanout manageable
+            pid_col = tbl.column('person_id')
+            buckets = pc.mod(pid_col, pa.scalar(1024, type=pa.int64()))
+            tbl = tbl.append_column('pid_bucket', buckets)
             pds.write_dataset(
                 tbl,
                 base_dir=self.events_dir,
                 format="parquet",
-                partitioning=["person_id"],
+                partitioning=["pid_bucket"],
                 existing_data_behavior="overwrite_or_ignore"
             )
-            logger.info("[FAST] Events written (partitioned by person_id)")
+            logger.info("[FAST] Events written (partitioned by pid_bucket)")
         except Exception as e:
             logger.error(f"Error writing partitioned events: {e}")
             raise
