@@ -90,16 +90,51 @@ class OMOPDataProcessor:
             for file_path in chunk_files:
                 try:
                     logger.info(f"Loading file: {os.path.basename(file_path)}")
-                    # Read parquet file
-                    table = pq.read_table(file_path)
-                    df = table.to_pandas()
-                    logger.info(f"Loaded {len(df)} rows from {os.path.basename(file_path)}")
-                    chunk_data.append(df)
                     
-                    # Check memory usage
-                    if not self.check_memory_limit():
-                        logger.info(f"Memory limit approaching, processing chunk {i//data_config.chunk_size + 1}")
-                        break
+                    # Try different loading methods for All of Us data
+                    df = None
+                    
+                    # Method 1: Try pandas read_parquet (handles custom types better)
+                    try:
+                        df = pd.read_parquet(file_path, engine='pyarrow')
+                        logger.info(f"Successfully loaded with pandas read_parquet")
+                    except Exception as e1:
+                        logger.info(f"pandas read_parquet failed: {e1}")
+                        
+                        # Method 2: Try pyarrow with specific options
+                        try:
+                            import pyarrow.parquet as pq
+                            table = pq.read_table(file_path, use_threads=True)
+                            df = table.to_pandas()
+                            logger.info(f"Successfully loaded with pyarrow read_table")
+                        except Exception as e2:
+                            logger.info(f"pyarrow read_table failed: {e2}")
+                            
+                            # Method 3: Try with fastparquet engine
+                            try:
+                                df = pd.read_parquet(file_path, engine='fastparquet')
+                                logger.info(f"Successfully loaded with fastparquet engine")
+                            except Exception as e3:
+                                logger.error(f"All loading methods failed for {file_path}")
+                                logger.error(f"  pandas: {e1}")
+                                logger.error(f"  pyarrow: {e2}")
+                                logger.error(f"  fastparquet: {e3}")
+                                continue
+                    
+                    if df is not None:
+                        logger.info(f"Loaded {len(df)} rows from {os.path.basename(file_path)}")
+                        logger.info(f"Columns: {list(df.columns)}")
+                        logger.info(f"Data types: {df.dtypes.to_dict()}")
+                        
+                        # Handle All of Us specific data type issues
+                        df = self._fix_all_of_us_data_types(df, table_name)
+                        
+                        chunk_data.append(df)
+                        
+                        # Check memory usage
+                        if not self.check_memory_limit():
+                            logger.info(f"Memory limit approaching, processing chunk {i//data_config.chunk_size + 1}")
+                            break
                         
                 except Exception as e:
                     logger.warning(f"Error loading {file_path}: {e}")
@@ -115,6 +150,57 @@ class OMOPDataProcessor:
                 # Clear memory
                 del combined_chunk, chunk_data
                 gc.collect()
+    
+    def _fix_all_of_us_data_types(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
+        """Fix All of Us specific data type issues"""
+        logger.info(f"Fixing data types for {table_name} table")
+        
+        # Convert problematic columns
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                # Try to convert to datetime if it looks like a date
+                if any(keyword in col.lower() for keyword in ['date', 'time', 'start', 'end']):
+                    try:
+                        # Handle All of Us custom date format
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                        logger.info(f"Converted {col} to datetime")
+                    except Exception as e:
+                        logger.info(f"Could not convert {col} to datetime: {e}")
+                
+                # Try to convert to numeric if it looks like a number
+                elif any(keyword in col.lower() for keyword in ['id', 'concept', 'value', 'count']):
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                        logger.info(f"Converted {col} to numeric")
+                    except Exception as e:
+                        logger.info(f"Could not convert {col} to numeric: {e}")
+        
+        # Handle specific table issues
+        if table_name == 'person':
+            # Fix birth_datetime if it's not already a datetime
+            if 'birth_datetime' in df.columns and df['birth_datetime'].dtype != 'datetime64[ns]':
+                try:
+                    df['birth_datetime'] = pd.to_datetime(df['birth_datetime'], errors='coerce')
+                    logger.info("Fixed birth_datetime column")
+                except Exception as e:
+                    logger.warning(f"Could not fix birth_datetime: {e}")
+        
+        elif table_name in ['visit_occurrence', 'condition_occurrence', 'drug_exposure', 
+                           'procedure_occurrence', 'measurement', 'observation']:
+            # Fix datetime columns
+            datetime_cols = [col for col in df.columns if any(keyword in col.lower() 
+                           for keyword in ['date', 'time', 'start', 'end'])]
+            
+            for col in datetime_cols:
+                if col in df.columns and df[col].dtype != 'datetime64[ns]':
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                        logger.info(f"Fixed {col} column")
+                    except Exception as e:
+                        logger.warning(f"Could not fix {col}: {e}")
+        
+        logger.info(f"Data type fixes completed for {table_name}")
+        return df
     
     def process_person_table(self) -> Dict[int, Dict]:
         """Process person table to get patient demographics"""
