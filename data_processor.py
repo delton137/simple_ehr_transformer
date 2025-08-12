@@ -75,9 +75,11 @@ class OMOPDataProcessor:
         
         if not parquet_files:
             logger.warning(f"No parquet files found in {table_dir}")
+            logger.info(f"Contents of {table_dir}: {os.listdir(table_dir)}")
             return
         
         logger.info(f"Loading {table_name} from {len(parquet_files)} parquet files")
+        logger.info(f"Files: {[os.path.basename(f) for f in parquet_files]}")
         
         # Process files in chunks
         for i in range(0, len(parquet_files), data_config.chunk_size):
@@ -87,9 +89,11 @@ class OMOPDataProcessor:
             chunk_data = []
             for file_path in chunk_files:
                 try:
+                    logger.info(f"Loading file: {os.path.basename(file_path)}")
                     # Read parquet file
                     table = pq.read_table(file_path)
                     df = table.to_pandas()
+                    logger.info(f"Loaded {len(df)} rows from {os.path.basename(file_path)}")
                     chunk_data.append(df)
                     
                     # Check memory usage
@@ -119,6 +123,10 @@ class OMOPDataProcessor:
         person_data = {}
         
         for chunk in self.load_omop_data_chunked("person"):
+            logger.info(f"Processing person chunk with {len(chunk)} rows")
+            logger.info(f"Person chunk columns: {list(chunk.columns)}")
+            logger.info(f"First few person IDs: {chunk['person_id'].head().tolist() if 'person_id' in chunk.columns else 'No person_id column'}")
+            
             for _, person in chunk.iterrows():
                 person_id = person['person_id']
                 person_data[person_id] = {
@@ -131,6 +139,8 @@ class OMOPDataProcessor:
                 }
         
         logger.info(f"Processed {len(person_data)} patients")
+        if person_data:
+            logger.info(f"Sample person data: {list(person_data.items())[:3]}")
         return person_data
     
     def process_visit_occurrence(self, person_data: Dict[int, Dict]) -> Dict[int, List[Dict]]:
