@@ -86,9 +86,14 @@ class OMOPDataProcessor:
               .rename({ts_col: "ts", cid_col: "cid"}))
         # Ensure expected columns exist with unified names
         to_add = []
-        if 'value_as_number' not in names:
+        # For non-measurement tables, always add null placeholders
+        if val_col is None:
             to_add.append(pl.lit(None).cast(pl.Float64).alias('value_as_number'))
-        if 'unit_concept_id' not in names:
+        elif 'value_as_number' not in names:
+            to_add.append(pl.lit(None).cast(pl.Float64).alias('value_as_number'))
+        if unit_col is None:
+            to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
+        elif 'unit_concept_id' not in names:
             to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
         if to_add:
             lf = lf.with_columns(to_add)
