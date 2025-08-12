@@ -156,8 +156,10 @@ class OMOPDataProcessor:
             "person_id", "gender_concept_id", "race_concept_id", "ethnicity_concept_id",
             "birth_datetime", "death_datetime"
         ]
-        lf = pl.scan_parquet(path).select([c for c in cols if c in (pl.scan_parquet(path).columns)])
-        if "birth_datetime" in lf.columns:
+        base_scan = pl.scan_parquet(path)
+        names = base_scan.collect_schema().names()
+        lf = base_scan.select([c for c in cols if c in names])
+        if "birth_datetime" in names:
             lf = lf.with_columns(pl.col("birth_datetime").cast(pl.Datetime("ns")))
         df = lf.collect()
         person_data: Dict[int, Dict[str, Any]] = {}
@@ -187,7 +189,7 @@ class OMOPDataProcessor:
         counts = (events_lazy
                   .group_by(["et", "cid"])  # polars uses group_by in recent versions
                   .agg(pl.len().alias("n"))
-                  .collect(streaming=True))
+                  .collect())
         concept_counts: Counter = Counter()
         for et, cid, n in counts.iter_rows():
             if et in ("condition", "medication", "procedure", "measurement"):
@@ -203,7 +205,7 @@ class OMOPDataProcessor:
         meas = events_lazy.filter(pl.col("et") == "measurement").select(["cid", "value_as_number"]).drop_nulls()
         # Approximate deciles per measurement concept
         # Collect to eager with streaming; then groupby in Polars
-        mdf = meas.collect(streaming=True)
+        mdf = meas.collect()
         quantile_mappings: Dict[str, np.ndarray] = {}
         if mdf.height:
             gb = mdf.group_by("cid")
@@ -220,60 +222,68 @@ class OMOPDataProcessor:
     def _tokenize_from_partitions(self, person_data: Dict[int, Dict[str, Any]]) -> Dict[int, List[int]]:
         logger.info("[FAST] Tokenizing per-person partitions (sequential)...")
         tokenized: Dict[int, List[int]] = {}
-        # Iterate over partition directories/files
         if not os.path.exists(self.events_dir):
             logger.error(f"Partitioned events directory not found: {self.events_dir}")
             return tokenized
-        # Polars can glob
+        # Iterate over pid_bucket partitions and group by person_id inside each file
         for file in Path(self.events_dir).rglob('*.parquet'):
-            # person_id=<id>/part-...parquet (Polars uses person_id=value directory naming)
             try:
-                # Extract person_id from path parts
-                pid = None
-                for part in file.parts:
-                    if part.startswith('person_id='):
-                        pid = int(part.split('=')[1])
-                        break
-                if pid is None:
+                df = pl.read_parquet(str(file))
+                if df.is_empty():
                     continue
-                if pid not in person_data:
+                # Ensure expected columns exist
+                expected_cols = {"person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id"}
+                missing = expected_cols - set(df.columns)
+                if missing:
+                    logger.warning(f"Skipping {file} due to missing columns: {missing}")
                     continue
-                df = pl.read_parquet(str(file)).sort("ts")
-                # Build timeline events quickly
-                timeline: List[Dict[str, Any]] = []
-                # Static event
-                pinfo = person_data[pid]
-                timeline.append({
-                    'timestamp': pinfo.get('birth_datetime', datetime.now()),
-                    'event_type': 'static',
-                    'gender': pinfo.get('gender_concept_id'),
-                    'race': pinfo.get('race_concept_id'),
-                    'ethnicity': pinfo.get('ethnicity_concept_id'),
-                    'birth_year': pinfo.get('birth_year'),
-                    'data': pinfo
-                })
-                # Clinical events
-                for et, ts, cid, val, unit in df.iter_rows():
-                    ev: Dict[str, Any] = {'timestamp': ts, 'event_type': et}
-                    if et == 'condition':
-                        ev['condition_concept_id'] = cid
-                    elif et == 'medication':
-                        ev['drug_concept_id'] = cid
-                    elif et == 'procedure':
-                        ev['procedure_concept_id'] = cid
-                    elif et == 'measurement':
-                        ev['measurement_concept_id'] = cid
-                        ev['value_as_number'] = val
-                        ev['unit_concept_id'] = unit
-                    elif et == 'observation':
-                        ev['observation_concept_id'] = cid
-                    timeline.append(ev)
-                # Tokenize
-                birth_year = pinfo.get('birth_year')
-                current_year = datetime.now().year
-                patient_age = (current_year - birth_year) if birth_year else 50
-                tokens = self.tokenize_timeline(timeline, patient_age)
-                tokenized[pid] = tokens
+                # Sort for deterministic order and group by person_id
+                df = df.sort(["person_id", "ts"]) 
+                gb = df.group_by("person_id")
+                for (pid,), sub in gb:
+                    pid = int(pid)
+                    if pid not in person_data:
+                        continue
+                    sub = sub.sort("ts")
+                    # Build timeline
+                    pinfo = person_data[pid]
+                    timeline: List[Dict[str, Any]] = [{
+                        'timestamp': pinfo.get('birth_datetime', datetime.now()),
+                        'event_type': 'static',
+                        'gender': pinfo.get('gender_concept_id'),
+                        'race': pinfo.get('race_concept_id'),
+                        'ethnicity': pinfo.get('ethnicity_concept_id'),
+                        'birth_year': pinfo.get('birth_year'),
+                        'data': pinfo,
+                    }]
+                    for row in sub.iter_rows(named=True):
+                        ts = row.get('ts')
+                        if ts is None:
+                            continue
+                        et = row.get('et')
+                        cid = row.get('cid')
+                        val = row.get('value_as_number')
+                        unit = row.get('unit_concept_id')
+                        ev: Dict[str, Any] = {'timestamp': ts, 'event_type': et}
+                        if et == 'condition':
+                            ev['condition_concept_id'] = cid
+                        elif et == 'medication':
+                            ev['drug_concept_id'] = cid
+                        elif et == 'procedure':
+                            ev['procedure_concept_id'] = cid
+                        elif et == 'measurement':
+                            ev['measurement_concept_id'] = cid
+                            ev['value_as_number'] = val
+                            ev['unit_concept_id'] = unit
+                        elif et == 'observation':
+                            ev['observation_concept_id'] = cid
+                        timeline.append(ev)
+                    # Tokenize
+                    birth_year = pinfo.get('birth_year')
+                    current_year = datetime.now().year
+                    patient_age = (current_year - birth_year) if birth_year else 50
+                    tokens = self.tokenize_timeline(timeline, patient_age)
+                    tokenized[pid] = tokens
             except Exception as e:
                 logger.warning(f"Tokenization failed for {file}: {e}")
                 continue
