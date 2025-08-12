@@ -79,14 +79,19 @@ class OMOPDataProcessor:
             cols.append(val_col)
         if unit_col:
             cols.append(unit_col)
-        lf = (pl.scan_parquet(path)
-              .select([c for c in cols if c in (pl.scan_parquet(path).columns)])
+        base_scan = pl.scan_parquet(path)
+        names = base_scan.collect_schema().names()
+        lf = (base_scan
+              .select([c for c in cols if c in names])
               .rename({ts_col: "ts", cid_col: "cid"}))
         # Add any missing optional columns as nulls
-        if val_col and val_col not in lf.columns:
-            lf = lf.with_columns(pl.lit(None).cast(pl.Float64).alias(val_col))
-        if unit_col and unit_col not in lf.columns:
-            lf = lf.with_columns(pl.lit(None).cast(pl.Int64).alias(unit_col))
+        missing_cols = []
+        if val_col and val_col not in names:
+            missing_cols.append(pl.lit(None).cast(pl.Float64).alias(val_col))
+        if unit_col and unit_col not in names:
+            missing_cols.append(pl.lit(None).cast(pl.Int64).alias(unit_col))
+        if missing_cols:
+            lf = lf.with_columns(missing_cols)
         lf = lf.with_columns([
             pl.lit(et_str).alias("et")
         ])
@@ -109,9 +114,21 @@ class OMOPDataProcessor:
     def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
         logger.info(f"[FAST] Writing partitioned events to {self.events_dir} ...")
         os.makedirs(self.events_dir, exist_ok=True)
-        # Use Polars multi-threaded writer
-        events_lazy.sink_parquet(self.events_dir, partition_by="person_id", compression="zstd", maintain_order=False)
-        logger.info("[FAST] Events written (partitioned by person_id)")
+        # Collect lazily (streaming) then write partitioned with PyArrow dataset API
+        try:
+            tbl = events_lazy.collect(streaming=True).to_arrow()
+            import pyarrow.dataset as pds
+            pds.write_dataset(
+                tbl,
+                base_dir=self.events_dir,
+                format="parquet",
+                partitioning=["person_id"],
+                existing_data_behavior="overwrite_or_ignore"
+            )
+            logger.info("[FAST] Events written (partitioned by person_id)")
+        except Exception as e:
+            logger.error(f"Error writing partitioned events: {e}")
+            raise
     
     def _load_person_static_pl(self) -> Dict[int, Dict[str, Any]]:
         path = os.path.join(self.omop_data_dir, "person", "*.parquet")
