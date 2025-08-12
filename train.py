@@ -67,7 +67,7 @@ class ETHOSTrainer:
         # AMP scaler
         self.scaler: Optional[torch.cuda.amp.GradScaler]
         if self.use_amp and torch.cuda.is_available():
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
         
@@ -99,27 +99,33 @@ class ETHOSTrainer:
             # Forward pass
             if (batch_idx % self.grad_accum_steps) == 0:
                 self.optimizer.zero_grad(set_to_none=True)
-            
-            if self.scaler is not None:
-                with torch.cuda.amp.autocast():
+            # Avoid gradient synchronization on non-accumulation steps when using DDP
+            from contextlib import nullcontext
+            sync_ctx = nullcontext()
+            if isinstance(self.model, DDP) and (((batch_idx + 1) % self.grad_accum_steps) != 0):
+                sync_ctx = self.model.no_sync()
+
+            with sync_ctx:
+                if self.scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        logits = self.model(input_ids)
+                        batch_size, seq_len, vocab_size = logits.size()
+                        logits = logits.view(-1, vocab_size)
+                        targets = target_ids.view(-1)
+                        loss = self.criterion(logits, targets)
+                        loss = loss / self.grad_accum_steps
+                    self.scaler.scale(loss).backward()
+                else:
                     logits = self.model(input_ids)
+                    # Reshape for loss calculation
                     batch_size, seq_len, vocab_size = logits.size()
                     logits = logits.view(-1, vocab_size)
                     targets = target_ids.view(-1)
+                    # Calculate loss
                     loss = self.criterion(logits, targets)
                     loss = loss / self.grad_accum_steps
-                self.scaler.scale(loss).backward()
-            else:
-                logits = self.model(input_ids)
-                # Reshape for loss calculation
-                batch_size, seq_len, vocab_size = logits.size()
-                logits = logits.view(-1, vocab_size)
-                targets = target_ids.view(-1)
-                # Calculate loss
-                loss = self.criterion(logits, targets)
-                loss = loss / self.grad_accum_steps
-                # Backward pass
-                loss.backward()
+                    # Backward pass
+                    loss.backward()
             
             # Step optimizer on accumulation boundary
             if ((batch_idx + 1) % self.grad_accum_steps) == 0 or ((batch_idx + 1) == len(self.train_loader)):
@@ -164,7 +170,7 @@ class ETHOSTrainer:
                 
                 # Forward pass
                 if self.scaler is not None and torch.cuda.is_available():
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         logits = self.model(input_ids)
                         batch_size, seq_len, vocab_size = logits.size()
                         logits = logits.view(-1, vocab_size)
@@ -437,8 +443,9 @@ def main():
         train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if ddp else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if ddp else None
-        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=(not ddp), num_workers=args.num_workers, sampler=train_sampler)
-        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, sampler=val_sampler)
+        # Drop last batch in train to avoid uneven last batch across ranks
+        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=(not ddp), num_workers=args.num_workers, sampler=train_sampler, drop_last=True)
+        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, sampler=val_sampler, drop_last=False)
         if is_rank0:
             print(f"✅ Training batches: {len(train_loader)}")
             print(f"✅ Validation batches: {len(val_loader)}")

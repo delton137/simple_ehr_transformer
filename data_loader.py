@@ -58,12 +58,13 @@ class PHTDataLoader:
     """Data loader for PHT training with batching and padding"""
     
     def __init__(self, dataset: PHTDataset, batch_size: int = 32, 
-                 shuffle: bool = True, num_workers: int = 4, sampler=None):
+                 shuffle: bool = True, num_workers: int = 4, sampler=None, drop_last: bool = False):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = False if sampler is not None else shuffle
         self.num_workers = num_workers
         self.sampler = sampler
+        self.drop_last = drop_last
         
         # Create data loader
         self.dataloader = DataLoader(
@@ -73,7 +74,8 @@ class PHTDataLoader:
             num_workers=num_workers,
             collate_fn=self._collate_fn,
             pin_memory=True,
-            sampler=self.sampler
+            sampler=self.sampler,
+            drop_last=self.drop_last
         )
     
     def _collate_fn(self, batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
