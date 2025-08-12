@@ -121,10 +121,11 @@ class PHTDataProcessor:
     """Data processor for training data preparation"""
     
     def __init__(self, tokenized_timelines: Dict[int, List[int]], 
-                 vocab_size: int, train_split: float = 0.9):
+                 vocab_size: int, train_split: float = 0.9, seed: int = 42):
         self.tokenized_timelines = tokenized_timelines
         self.vocab_size = vocab_size
         self.train_split = train_split
+        self.seed = seed
         
         # Split data into train/validation sets
         self.train_data, self.val_data = self._split_data()
@@ -133,8 +134,10 @@ class PHTDataProcessor:
     
     def _split_data(self) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
         """Split data into training and validation sets"""
-        patient_ids = list(self.tokenized_timelines.keys())
-        random.shuffle(patient_ids)
+        # Deterministic, rank-agnostic ordering
+        patient_ids = sorted(self.tokenized_timelines.keys())
+        rng = random.Random(self.seed)
+        rng.shuffle(patient_ids)
         
         split_idx = int(len(patient_ids) * self.train_split)
         train_ids = patient_ids[:split_idx]

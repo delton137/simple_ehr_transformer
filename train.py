@@ -439,7 +439,7 @@ def main():
     if is_rank0:
         print("\n🔧 Creating data loaders...")
     try:
-        data_processor = PHTDataProcessor(tokenized_timelines, len(vocab))
+        data_processor = PHTDataProcessor(tokenized_timelines, len(vocab), train_split=0.9, seed=42)
         # Respect max_seq_len from args
         train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
         train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if ddp else None
@@ -470,6 +470,8 @@ def main():
                 gradient_as_bucket_view=True,
                 static_graph=True,
             )
+            if is_rank0:
+                print("DDP enabled: static_graph=True, gradient_as_bucket_view=True")
         elif args.device in ('auto', 'cuda') and torch.cuda.is_available() and torch.cuda.device_count() > 1:
             # Fallback to DataParallel only when not using DDP
             if is_rank0:
@@ -511,7 +513,10 @@ def main():
         return
     finally:
         if ddp and dist.is_initialized():
-            dist.destroy_process_group()
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
