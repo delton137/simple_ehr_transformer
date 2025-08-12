@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 from typing import Dict, List, Tuple, Optional, Any, Iterator
 from datetime import datetime, timedelta
 import logging
@@ -23,6 +24,12 @@ import tempfile
 import shutil
 import argparse
 
+# Optional high-performance engine
+try:
+    import polars as pl
+except Exception:  # pragma: no cover
+    pl = None
+
 from config import data_config, token_config, model_config
 
 # Set up logging
@@ -32,7 +39,7 @@ logger = logging.getLogger(__name__)
 class OMOPDataProcessor:
     """Process large OMOP datasets with memory optimization"""
     
-    def __init__(self, data_path: str = None):
+    def __init__(self, data_path: str = None, engine: str = None, num_workers: int = None):
         self.vocab = {}
         self.vocab_size = 0
         self.quantile_mappings = {}
@@ -46,21 +53,247 @@ class OMOPDataProcessor:
         else:
             self.omop_data_dir = data_config.omop_data_dir
         
+        # Engine selection
+        if engine is None:
+            self.engine = 'polars' if pl is not None else 'python'
+        else:
+            self.engine = engine
+        
+        # Workers
+        self.num_workers = num_workers or max(1, (os.cpu_count() or 4) - 1)
+        
         # Memory monitoring
         self.memory_limit_bytes = data_config.memory_limit_gb * 1024**3
+        
+        # Derived paths
+        self.events_dir = os.path.join(data_config.output_dir, 'events_partitioned')
     
+    # =====================
+    # Fast path (Polars)
+    # =====================
+    def _scan_table_pl(self, table: str, ts_col: str, et_str: str, cid_col: str,
+                       val_col: Optional[str] = None, unit_col: Optional[str] = None) -> 'pl.LazyFrame':
+        path = os.path.join(self.omop_data_dir, table, "*.parquet")
+        cols = ["person_id", ts_col, cid_col]
+        if val_col:
+            cols.append(val_col)
+        if unit_col:
+            cols.append(unit_col)
+        lf = (pl.scan_parquet(path)
+              .select([c for c in cols if c in (pl.scan_parquet(path).columns)])
+              .rename({ts_col: "ts", cid_col: "cid"}))
+        # Add any missing optional columns as nulls
+        if val_col and val_col not in lf.columns:
+            lf = lf.with_columns(pl.lit(None).cast(pl.Float64).alias(val_col))
+        if unit_col and unit_col not in lf.columns:
+            lf = lf.with_columns(pl.lit(None).cast(pl.Int64).alias(unit_col))
+        lf = lf.with_columns([
+            pl.lit(et_str).alias("et")
+        ])
+        return lf
+    
+    def _build_events_polars(self) -> 'pl.LazyFrame':
+        logger.info("[FAST] Scanning OMOP tables with Polars (lazy)...")
+        cond = self._scan_table_pl("condition_occurrence", "condition_start_datetime", "condition", "condition_concept_id")
+        drug = self._scan_table_pl("drug_exposure", "drug_exposure_start_datetime", "medication", "drug_concept_id")
+        proc = self._scan_table_pl("procedure_occurrence", "procedure_datetime", "procedure", "procedure_concept_id")
+        meas = self._scan_table_pl("measurement", "measurement_datetime", "measurement", "measurement_concept_id", "value_as_number", "unit_concept_id")
+        obs  = self._scan_table_pl("observation", "observation_datetime", "observation", "observation_concept_id")
+        events = pl.concat([cond, drug, proc, meas, obs], how="vertical_relaxed")
+        events = (events
+                  .filter(pl.col("ts").is_not_null())
+                  .with_columns(pl.col("ts").cast(pl.Datetime("ns")))
+                  .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id"]))
+        return events
+    
+    def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
+        logger.info(f"[FAST] Writing partitioned events to {self.events_dir} ...")
+        os.makedirs(self.events_dir, exist_ok=True)
+        # Use Polars multi-threaded writer
+        events_lazy.sink_parquet(self.events_dir, partition_by="person_id", compression="zstd", maintain_order=False)
+        logger.info("[FAST] Events written (partitioned by person_id)")
+    
+    def _load_person_static_pl(self) -> Dict[int, Dict[str, Any]]:
+        path = os.path.join(self.omop_data_dir, "person", "*.parquet")
+        logger.info("[FAST] Loading person demographics (Polars)...")
+        cols = [
+            "person_id", "gender_concept_id", "race_concept_id", "ethnicity_concept_id",
+            "birth_datetime", "death_datetime"
+        ]
+        lf = pl.scan_parquet(path).select([c for c in cols if c in (pl.scan_parquet(path).columns)])
+        if "birth_datetime" in lf.columns:
+            lf = lf.with_columns(pl.col("birth_datetime").cast(pl.Datetime("ns")))
+        df = lf.collect()
+        person_data: Dict[int, Dict[str, Any]] = {}
+        if df.height:
+            for row in df.iter_rows(named=True):
+                pid = int(row.get("person_id"))
+                birth_dt = row.get("birth_datetime")
+                birth_year = None
+                if birth_dt is not None:
+                    try:
+                        birth_year = birth_dt.year
+                    except Exception:
+                        birth_year = None
+                person_data[pid] = {
+                    'gender_concept_id': row.get('gender_concept_id'),
+                    'race_concept_id': row.get('race_concept_id'),
+                    'ethnicity_concept_id': row.get('ethnicity_concept_id'),
+                    'birth_datetime': birth_dt,
+                    'death_datetime': row.get('death_datetime'),
+                    'birth_year': birth_year,
+                }
+        logger.info(f"[FAST] Loaded demographics for {len(person_data)} patients")
+        return person_data
+    
+    def _compute_stats_polars(self, events_lazy: 'pl.LazyFrame') -> Tuple[Counter, Dict[str, np.ndarray]]:
+        logger.info("[FAST] Computing concept frequencies (Polars)...")
+        counts = (events_lazy
+                  .groupby(["et", "cid"])  # lazy groupby
+                  .agg(pl.len().alias("n"))
+                  .collect(streaming=True))
+        concept_counts: Counter = Counter()
+        for et, cid, n in counts.iter_rows():
+            if et in ("condition", "medication", "procedure", "measurement"):
+                prefix = {
+                    "condition": "CONDITION_",
+                    "medication": "DRUG_",
+                    "procedure": "PROCEDURE_",
+                    "measurement": "MEASUREMENT_",
+                }[et]
+                concept_counts[f"{prefix}{cid}"] += int(n)
+        
+        logger.info("[FAST] Computing measurement quantiles (Polars)...")
+        meas = events_lazy.filter(pl.col("et") == "measurement").select(["cid", "value_as_number"]).drop_nulls()
+        # Approximate deciles per measurement concept
+        # Collect to eager with streaming; then groupby in Polars
+        mdf = meas.collect(streaming=True)
+        quantile_mappings: Dict[str, np.ndarray] = {}
+        if mdf.height:
+            gb = mdf.group_by("cid")
+            for cid, sub in gb:
+                vals = sub.get_column("value_as_number").to_numpy()
+                if vals.size >= 10:
+                    try:
+                        qs = np.percentile(vals, np.arange(0, 100, 10))
+                        quantile_mappings[str(cid)] = qs
+                    except Exception:
+                        continue
+        return concept_counts, quantile_mappings
+    
+    def _tokenize_from_partitions(self, person_data: Dict[int, Dict[str, Any]]) -> Dict[int, List[int]]:
+        logger.info("[FAST] Tokenizing per-person partitions (sequential)...")
+        tokenized: Dict[int, List[int]] = {}
+        # Iterate over partition directories/files
+        if not os.path.exists(self.events_dir):
+            logger.error(f"Partitioned events directory not found: {self.events_dir}")
+            return tokenized
+        # Polars can glob
+        for file in Path(self.events_dir).rglob('*.parquet'):
+            # person_id=<id>/part-...parquet (Polars uses person_id=value directory naming)
+            try:
+                # Extract person_id from path parts
+                pid = None
+                for part in file.parts:
+                    if part.startswith('person_id='):
+                        pid = int(part.split('=')[1])
+                        break
+                if pid is None:
+                    continue
+                if pid not in person_data:
+                    continue
+                df = pl.read_parquet(str(file)).sort("ts")
+                # Build timeline events quickly
+                timeline: List[Dict[str, Any]] = []
+                # Static event
+                pinfo = person_data[pid]
+                timeline.append({
+                    'timestamp': pinfo.get('birth_datetime', datetime.now()),
+                    'event_type': 'static',
+                    'gender': pinfo.get('gender_concept_id'),
+                    'race': pinfo.get('race_concept_id'),
+                    'ethnicity': pinfo.get('ethnicity_concept_id'),
+                    'birth_year': pinfo.get('birth_year'),
+                    'data': pinfo
+                })
+                # Clinical events
+                for et, ts, cid, val, unit in df.iter_rows():
+                    ev: Dict[str, Any] = {'timestamp': ts, 'event_type': et}
+                    if et == 'condition':
+                        ev['condition_concept_id'] = cid
+                    elif et == 'medication':
+                        ev['drug_concept_id'] = cid
+                    elif et == 'procedure':
+                        ev['procedure_concept_id'] = cid
+                    elif et == 'measurement':
+                        ev['measurement_concept_id'] = cid
+                        ev['value_as_number'] = val
+                        ev['unit_concept_id'] = unit
+                    elif et == 'observation':
+                        ev['observation_concept_id'] = cid
+                    timeline.append(ev)
+                # Tokenize
+                birth_year = pinfo.get('birth_year')
+                current_year = datetime.now().year
+                patient_age = (current_year - birth_year) if birth_year else 50
+                tokens = self.tokenize_timeline(timeline, patient_age)
+                tokenized[pid] = tokens
+            except Exception as e:
+                logger.warning(f"Tokenization failed for {file}: {e}")
+                continue
+        logger.info(f"[FAST] Tokenized {len(tokenized)} patients")
+        return tokenized
+    
+    def process_all_data_fast_polars(self) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
+        logger.info("[FAST] Processing OMOP data with Polars/PyArrow pipeline...")
+        events = self._build_events_polars()
+        self._write_events_partitioned(events)
+        person_data = self._load_person_static_pl()
+        # Create mappings
+        concept_counts, quantiles = self._compute_stats_polars(events)
+        self.quantile_mappings = quantiles
+        self.create_age_mappings()
+        self.create_time_interval_mappings()
+        # Build vocabulary using counts
+        logger.info("[FAST] Building vocabulary from concept frequencies...")
+        # Base tokens
+        self.vocab[token_config.pad_token] = 0
+        self.vocab[token_config.unk_token] = 1
+        self.vocab[token_config.eos_token] = 2
+        self.vocab[token_config.sos_token] = 3
+        for et in ["admission","discharge","condition","medication","procedure","measurement","observation","death"]:
+            self.vocab[f"EVENT_{et.upper()}"] = len(self.vocab)
+        for age_interval in self.age_mappings.keys():
+            self.vocab[f"AGE_{age_interval}"] = len(self.vocab)
+        for time_interval in self.time_interval_mappings.keys():
+            self.vocab[f"TIME_{time_interval}"] = len(self.vocab)
+        for i in range(model_config.max_quantile_tokens):
+            self.vocab[f"Q{i}"] = len(self.vocab)
+        # Add concept tokens up to capacity
+        max_concepts = model_config.vocab_size - len(self.vocab)
+        for concept, _n in concept_counts.most_common(max_concepts):
+            self.vocab[concept] = len(self.vocab)
+        self.vocab_size = len(self.vocab)
+        logger.info(f"[FAST] Vocabulary size: {self.vocab_size}")
+        # Tokenize from partitions
+        tokenized_timelines = self._tokenize_from_partitions(person_data)
+        # Save
+        self._save_processed_data(tokenized_timelines, {})
+        return tokenized_timelines, self.vocab
 
-    
+    # =====================
+    # Existing slower path (Python/Pandas)
+    # =====================
     def get_memory_usage(self) -> float:
         """Get current memory usage in GB"""
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / 1024**3
-    
+
     def check_memory_limit(self) -> bool:
         """Check if we're approaching memory limit"""
         current_memory = self.get_memory_usage()
         return current_memory < self.memory_limit_bytes * 0.8
-    
+
     def load_omop_data_chunked(self, table_name: str) -> Iterator[pd.DataFrame]:
         """Load OMOP table data in chunks to manage memory"""
         table_dir = os.path.join(self.omop_data_dir, table_name)
@@ -161,9 +394,7 @@ class OMOPDataProcessor:
                 # Clear memory
                 del combined_chunk, chunk_data
                 gc.collect()
-    
 
-    
     def _load_with_dbdate_handler(self, file_path: str) -> pd.DataFrame:
         """Custom loader for All of Us dbdate format"""
         try:
@@ -840,11 +1071,25 @@ class OMOPDataProcessor:
         
         # Add most frequent concepts (limit vocabulary size)
         max_concepts = model_config.vocab_size - len(self.vocab)
+        logger.info(f"Available slots for concepts: {max_concepts}")
+        logger.info(f"Total concepts found: {len(concept_counts)}")
+        
+        # Show top concepts by frequency
+        top_concepts = concept_counts.most_common(10)
+        logger.info(f"Top 10 concepts by frequency: {top_concepts}")
+        
         for concept, count in concept_counts.most_common(max_concepts):
             self.vocab[concept] = len(self.vocab)
         
         self.vocab_size = len(self.vocab)
         logger.info(f"Built vocabulary with {self.vocab_size} tokens")
+        logger.info(f"Breakdown:")
+        logger.info(f"  - Special tokens: 4")
+        logger.info(f"  - Event types: 8") 
+        logger.info(f"  - Age intervals: {len(self.age_mappings)}")
+        logger.info(f"  - Time intervals: {len(self.time_interval_mappings)}")
+        logger.info(f"  - Quantile tokens: {model_config.max_quantile_tokens}")
+        logger.info(f"  - Concept tokens: {len([k for k in self.vocab.keys() if k.startswith(('CONDITION_', 'DRUG_', 'PROCEDURE_', 'MEASUREMENT_'))])}")
     
     def tokenize_timeline(self, timeline: List[Dict], patient_age: float) -> List[int]:
         """Convert a patient timeline to tokens"""
@@ -1036,10 +1281,13 @@ class OMOPDataProcessor:
         logger.info("Processing all OMOP data...")
         logger.info(f"Data directory: {self.omop_data_dir}")
         logger.info(f"Memory limit: {data_config.memory_limit_gb:.1f} GB")
+        logger.info(f"Engine: {self.engine}")
         
+        if self.engine == 'polars' and pl is not None:
+            return self.process_all_data_fast_polars()
+        # Fallback to existing slower pipeline
         # Step 1: Process person table (demographics)
         person_data = self.process_person_table()
-        
         # Step 2: Process clinical tables
         visit_timelines = self.process_visit_occurrence(person_data)
         condition_timelines = self.process_condition_occurrence(person_data)
@@ -1048,35 +1296,27 @@ class OMOPDataProcessor:
         measurement_timelines = self.process_measurement(person_data)
         observation_timelines = self.process_observation(person_data)
         death_timelines = self.process_death(person_data)
-        
         # Step 3: Merge all timelines
         patient_timelines = self.merge_patient_timelines(
             person_data, visit_timelines, condition_timelines, drug_timelines,
             procedure_timelines, measurement_timelines, observation_timelines, death_timelines
         )
-        
         # Step 4: Create mappings
         self.create_quantile_mappings(patient_timelines)
         self.create_age_mappings()
         self.create_time_interval_mappings()
-        
         # Step 5: Build vocabulary
         self.build_vocabulary(patient_timelines)
-        
         # Step 6: Tokenize timelines (in chunks to manage memory)
         tokenized_timelines = {}
         patient_ids = list(patient_timelines.keys())
         chunk_size = data_config.max_patients_per_chunk
-        
         logger.info(f"Tokenizing {len(patient_ids)} patient timelines in chunks of {chunk_size}")
-        
         for i in range(0, len(patient_ids), chunk_size):
             chunk_ids = patient_ids[i:i + chunk_size]
             logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(patient_ids) + chunk_size - 1)//chunk_size}")
-            
             for patient_id in chunk_ids:
                 timeline = patient_timelines[patient_id]
-                
                 # Calculate patient age
                 static_event = next((e for e in timeline if e['event_type'] == 'static'), None)
                 if static_event and 'birth_year' in static_event:
@@ -1085,23 +1325,13 @@ class OMOPDataProcessor:
                         current_year = datetime.now().year
                         patient_age = current_year - birth_year
                     else:
-                        patient_age = 50  # Default age
+                        patient_age = 50
                 else:
-                    patient_age = 50  # Default age
-                
+                    patient_age = 50
                 tokens = self.tokenize_timeline(timeline, patient_age)
                 tokenized_timelines[patient_id] = tokens
-            
-            # Clear memory after each chunk
             gc.collect()
-            
-            # Check memory usage
-            current_memory = self.get_memory_usage()
-            logger.info(f"Memory usage after chunk {i//chunk_size + 1}: {current_memory:.1f} GB")
-        
-        # Step 7: Save processed data
         self._save_processed_data(tokenized_timelines, patient_timelines)
-        
         return tokenized_timelines, self.vocab
     
     def _save_processed_data(self, tokenized_timelines: Dict[int, List[int]], 
@@ -1158,8 +1388,11 @@ def main():
                        help='Force reprocessing even if data exists')
     parser.add_argument('--tag', type=str, default=None,
                        help='Dataset tag for isolating different datasets (e.g., aou_2023, mimic_iv)')
+    parser.add_argument('--engine', type=str, choices=['polars','arrow','python'], default='polars',
+                       help='Processing engine: polars (fast), arrow, or python (fallback)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of workers for parallel steps (default: CPU cores - 1)')
 
-    
     args = parser.parse_args()
     
     # Override config values if provided
@@ -1175,10 +1408,8 @@ def main():
     # Create output directory
     os.makedirs(data_config.output_dir, exist_ok=True)
     
-    # Initialize processor with custom data path
-    processor = OMOPDataProcessor(data_path=args.data_path)
-    
-
+    # Initialize processor with custom data path and engine
+    processor = OMOPDataProcessor(data_path=args.data_path, engine=args.engine, num_workers=args.num_workers)
     
     # Check if we should reprocess
     should_reprocess = args.force_reprocess
@@ -1221,8 +1452,6 @@ def main():
         print(f"\n📁 Dataset tag: {args.tag}")
         print(f"📁 Output directory: {data_config.output_dir}")
         print(f"💡 To use this dataset in other scripts, use: --data_dir {data_config.output_dir}")
-    
-
 
 if __name__ == "__main__":
     main()

@@ -361,7 +361,7 @@ def main():
         criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
         
         # Create model directory with tag
-        model_dir = f"models_{args.tag}" if args.tag else "models"
+        model_dir = os.path.join("models", args.tag) if args.tag else "models"
         os.makedirs(model_dir, exist_ok=True)
         
         # Training loop

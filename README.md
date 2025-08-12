@@ -142,8 +142,8 @@ python train.py --tag aou_2023 --batch_size 64 --max_epochs 200
 python train.py --tag mimic_iv --batch_size 32 --max_epochs 100
 
 # Models are saved to separate directories:
-# - models_aou_2023/
-# - models_mimic_iv/
+# - models/aou_2023/
+# - models/mimic_iv/
 ```
 
 ### 3. Inference
@@ -155,7 +155,7 @@ Run inference with the trained model:
 python inference.py --model_path models/best_checkpoint.pth --patient_id 12345
 
 # Inference with tagged dataset
-python inference.py --tag aou_2023 --model_path models_aou_2023/best_checkpoint.pth
+python inference.py --tag aou_2023 --model_path models/aou_2023/best_checkpoint.pth
 
 # Inference with custom data directory
 python inference.py --model_path models/best_checkpoint.pth --data_dir processed_data_aou_2023
@@ -171,10 +171,10 @@ Inference options:
 **Tag-based Inference:**
 ```bash
 # Analyze All of Us 2023 patients
-python inference.py --tag aou_2023 --model_path models_aou_2023/best_checkpoint.pth
+python inference.py --tag aou_2023 --model_path models/aou_2023/best_checkpoint.pth
 
 # Analyze MIMIC-IV patients
-python inference.py --tag mimic_iv --model_path models_mimic_iv/best_checkpoint.pth
+python inference.py --tag mimic_iv --model_path models/mimic_iv/best_checkpoint.pth
 
 # Results are saved to separate directories:
 # - inference_results_aou_2023/

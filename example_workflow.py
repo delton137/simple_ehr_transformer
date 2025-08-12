@@ -165,7 +165,7 @@ def main():
     
     try:
         # Check if we have a trained model
-        model_dir = f"models_{args.tag}" if args.tag else "models"
+        model_dir = os.path.join("models", args.tag) if args.tag else "models"
         model_paths = [f'{model_dir}/best_checkpoint.pth', f'{model_dir}/latest_checkpoint.pth']
         model_path = None
         
