@@ -123,8 +123,11 @@ class OMOPDataProcessor:
         events = pl.concat([cond, drug, proc, meas, obs], how="vertical_relaxed")
         events = (events
                   .filter(pl.col("ts").is_not_null())
-                  .with_columns(pl.col("ts").cast(pl.Datetime("ns")))
-                  .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id"]))
+                  .with_columns([
+                      pl.col("ts").cast(pl.Datetime("ns")),
+                      (pl.col("person_id") % 1024).cast(pl.Int64).alias("pid_bucket")
+                  ])
+                  .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id", "pid_bucket"]))
         return events
     
     def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
@@ -133,17 +136,7 @@ class OMOPDataProcessor:
         # Collect lazily (streaming) then write partitioned with PyArrow dataset API
         try:
             tbl = events_lazy.collect().to_arrow()
-            import pyarrow as pa
-            import pyarrow.compute as pc
             import pyarrow.dataset as pds
-            # Add a bucket column to limit number of partitions
-            # 1024 buckets keeps directory fanout manageable
-            pid_col = tbl.column('person_id')
-            # Compute pid % 1024 using floor_divide to maintain compatibility
-            divisor = pa.scalar(1024, type=pa.int64())
-            q = pc.floor_divide(pid_col, divisor)
-            buckets = pc.subtract(pid_col, pc.multiply(divisor, q))
-            tbl = tbl.append_column('pid_bucket', buckets)
             pds.write_dataset(
                 tbl,
                 base_dir=self.events_dir,
