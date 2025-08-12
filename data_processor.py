@@ -48,125 +48,8 @@ class OMOPDataProcessor:
         
         # Memory monitoring
         self.memory_limit_bytes = data_config.memory_limit_gb * 1024**3
-        
-        # Check if we need to convert dbdate files
-        self.converted_dir = None
-        self._check_and_convert_dbdate_files()
     
-    def _check_and_convert_dbdate_files(self):
-        """Check if we need to convert dbdate files and do so automatically"""
-        logger.info("Checking for dbdate files that need conversion...")
-        
-        # Check if this is a converted format already
-        if self._is_converted_format():
-            logger.info("Data appears to be in converted format - no conversion needed")
-            return
-        
-        # Check if we have dbdate issues
-        if self._has_dbdate_issues():
-            logger.info("Detected dbdate files - running automatic conversion...")
-            self._run_dbdate_conversion()
-        else:
-            logger.info("No dbdate issues detected")
-    
-    def _is_converted_format(self):
-        """Check if data is already in converted format (flat parquet files)"""
-        # Look for flat parquet files instead of subdirectories
-        flat_files = [f for f in os.listdir(self.omop_data_dir) if f.endswith('.parquet')]
-        if len(flat_files) >= 5:  # At least 5 OMOP tables
-            logger.info(f"Found {len(flat_files)} flat parquet files - appears to be converted format")
-            return True
-        return False
-    
-    def _has_dbdate_issues(self):
-        """Check if any tables have dbdate issues by trying to load them"""
-        test_tables = ['visit_occurrence', 'condition_occurrence']
-        
-        for table_name in test_tables:
-            table_dir = os.path.join(self.omop_data_dir, table_name)
-            if os.path.exists(table_dir):
-                parquet_file = os.path.join(table_dir, '000000000000.parquet')
-                if os.path.exists(parquet_file):
-                    try:
-                        # Try to load a small sample
-                        import pyarrow.parquet as pq
-                        table = pq.read_table(parquet_file)
-                        # If we get here, no dbdate issues
-                        return False
-                    except Exception as e:
-                        if 'dbdate' in str(e).lower():
-                            logger.info(f"Detected dbdate issue in {table_name}: {e}")
-                            return True
-        
-        return False
-    
-    def _run_dbdate_conversion(self):
-        """Run the dbdate conversion script automatically"""
-        try:
-            logger.info("Starting automatic dbdate conversion...")
-            
-            # Create conversion script path
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            conversion_script = os.path.join(script_dir, 'convert_dbdate_to_standard.py')
-            
-            if not os.path.exists(conversion_script):
-                logger.error(f"Conversion script not found: {conversion_script}")
-                logger.info("Please ensure convert_dbdate_to_standard.py is in the same directory")
-                return
-            
-            # Create output directory for converted files
-            import tempfile
-            self.converted_dir = os.path.join(
-                os.path.dirname(self.omop_data_dir),
-                f"{os.path.basename(self.omop_data_dir)}_converted"
-            )
-            
-            logger.info(f"Converting data to: {self.converted_dir}")
-            
-            # Run the conversion script
-            import subprocess
-            import sys
-            
-            cmd = [
-                sys.executable, conversion_script,
-                '--input_dir', self.omop_data_dir,
-                '--output_dir', self.converted_dir
-            ]
-            
-            logger.info(f"Running: {' '.join(cmd)}")
-            
-            # Run conversion with progress output
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
-            
-            # Stream output in real-time
-            for line in process.stdout:
-                line = line.strip()
-                if line:
-                    logger.info(f"[CONVERSION] {line}")
-            
-            # Wait for completion
-            return_code = process.wait()
-            
-            if return_code == 0:
-                logger.info("✅ Dbdate conversion completed successfully!")
-                logger.info(f"📁 Converted data available at: {self.converted_dir}")
-                
-                # Update the data directory to use converted files
-                self.omop_data_dir = self.converted_dir
-                
-            else:
-                logger.error(f"❌ Dbdate conversion failed with return code: {return_code}")
-                logger.info("Falling back to original data directory")
-                
-        except Exception as e:
-            logger.error(f"Error during automatic dbdate conversion: {e}")
-            logger.info("Falling back to original data directory")
+
     
     def get_memory_usage(self) -> float:
         """Get current memory usage in GB"""
@@ -180,18 +63,6 @@ class OMOPDataProcessor:
     
     def load_omop_data_chunked(self, table_name: str) -> Iterator[pd.DataFrame]:
         """Load OMOP table data in chunks to manage memory"""
-        table_dir = os.path.join(self.omop_data_dir, table_name)
-        
-        # Check if this is a converted format (flat files) or original format (subdirectories)
-        if os.path.exists(table_dir) and os.path.isdir(table_dir):
-            # Original format: subdirectories with parquet files
-            return self._load_from_subdirectories(table_name)
-        else:
-            # Converted format: flat parquet files
-            return self._load_from_flat_files(table_name)
-    
-    def _load_from_subdirectories(self, table_name: str) -> Iterator[pd.DataFrame]:
-        """Load from original All of Us format with subdirectories"""
         table_dir = os.path.join(self.omop_data_dir, table_name)
         
         if not os.path.exists(table_dir):
@@ -209,7 +80,7 @@ class OMOPDataProcessor:
             logger.info(f"Contents of {table_dir}: {os.listdir(table_dir)}")
             return
         
-        logger.info(f"Loading {table_name} from {len(parquet_files)} parquet files (subdirectory format)")
+        logger.info(f"Loading {table_name} from {len(parquet_files)} parquet files")
         logger.info(f"Files: {[os.path.basename(f) for f in parquet_files]}")
         
         # Process files in chunks
@@ -291,40 +162,7 @@ class OMOPDataProcessor:
                 del combined_chunk, chunk_data
                 gc.collect()
     
-    def _load_from_flat_files(self, table_name: str) -> Iterator[pd.DataFrame]:
-        """Load from converted format with flat parquet files"""
-        table_file = os.path.join(self.omop_data_dir, f'{table_name}.parquet')
-        
-        if not os.path.exists(table_file):
-            logger.warning(f"Table file {table_file} does not exist")
-            return
-        
-        logger.info(f"Loading {table_name} from converted flat file: {table_file}")
-        
-        try:
-            # Load the converted parquet file
-            df = pd.read_parquet(table_file, engine='pyarrow')
-            logger.info(f"Successfully loaded {table_name} with {len(df)} rows")
-            logger.info(f"Columns: {list(df.columns)}")
-            logger.info(f"Data types: {df.dtypes.to_dict()}")
-            
-            # Handle any remaining data type issues
-            df = self._fix_all_of_us_data_types(df, table_name)
-            
-            # Yield the data in chunks for memory management
-            chunk_size = data_config.chunk_size
-            for i in range(0, len(df), chunk_size):
-                chunk = df.iloc[i:i + chunk_size].copy()
-                logger.info(f"Yielding chunk {i//chunk_size + 1}: {len(chunk)} rows")
-                yield chunk
-                
-                # Clear memory
-                del chunk
-                gc.collect()
-                
-        except Exception as e:
-            logger.error(f"Error loading converted file {table_file}: {e}")
-            return
+
     
     def _load_with_dbdate_handler(self, file_path: str) -> pd.DataFrame:
         """Custom loader for All of Us dbdate format"""
@@ -1320,8 +1158,7 @@ def main():
                        help='Force reprocessing even if data exists')
     parser.add_argument('--tag', type=str, default=None,
                        help='Dataset tag for isolating different datasets (e.g., aou_2023, mimic_iv)')
-    parser.add_argument('--no_auto_convert', action='store_true',
-                       help='Disable automatic dbdate conversion')
+
     
     args = parser.parse_args()
     
@@ -1341,10 +1178,7 @@ def main():
     # Initialize processor with custom data path
     processor = OMOPDataProcessor(data_path=args.data_path)
     
-    # Disable auto-conversion if requested
-    if args.no_auto_convert:
-        logger.info("Automatic dbdate conversion disabled by user")
-        processor.converted_dir = None
+
     
     # Check if we should reprocess
     should_reprocess = args.force_reprocess
@@ -1388,11 +1222,7 @@ def main():
         print(f"📁 Output directory: {data_config.output_dir}")
         print(f"💡 To use this dataset in other scripts, use: --data_dir {data_config.output_dir}")
     
-    # Show conversion information
-    if processor.converted_dir:
-        print(f"\n🔄 Dbdate conversion completed!")
-        print(f"📁 Converted data saved to: {processor.converted_dir}")
-        print(f"💡 You can reuse this converted data for future runs")
+
 
 if __name__ == "__main__":
     main()
