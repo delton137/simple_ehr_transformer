@@ -84,17 +84,28 @@ class OMOPDataProcessor:
         lf = (base_scan
               .select([c for c in cols if c in names])
               .rename({ts_col: "ts", cid_col: "cid"}))
-        # Add any missing optional columns as nulls
-        missing_cols = []
-        if val_col and val_col not in names:
-            missing_cols.append(pl.lit(None).cast(pl.Float64).alias(val_col))
-        if unit_col and unit_col not in names:
-            missing_cols.append(pl.lit(None).cast(pl.Int64).alias(unit_col))
-        if missing_cols:
-            lf = lf.with_columns(missing_cols)
+        # Ensure expected columns exist with unified names
+        to_add = []
+        if 'value_as_number' not in lf.columns:
+            to_add.append(pl.lit(None).cast(pl.Float64).alias('value_as_number'))
+        if 'unit_concept_id' not in lf.columns:
+            to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
+        if to_add:
+            lf = lf.with_columns(to_add)
+        # Add event type literal
+        lf = lf.with_columns([pl.lit(et_str).alias("et")])
+        # Cast dtypes consistently
+        # Some columns may be missing as nulls; cast handles them
         lf = lf.with_columns([
-            pl.lit(et_str).alias("et")
+            pl.col('person_id').cast(pl.Int64),
+            pl.col('ts').cast(pl.Datetime("ns")),
+            pl.col('cid').cast(pl.Int64),
+            pl.col('value_as_number').cast(pl.Float64),
+            pl.col('unit_concept_id').cast(pl.Int64),
+            pl.col('et').cast(pl.Utf8),
         ])
+        # Order columns identically across tables
+        lf = lf.select(['person_id', 'ts', 'et', 'cid', 'value_as_number', 'unit_concept_id'])
         return lf
     
     def _build_events_polars(self) -> 'pl.LazyFrame':
@@ -116,7 +127,7 @@ class OMOPDataProcessor:
         os.makedirs(self.events_dir, exist_ok=True)
         # Collect lazily (streaming) then write partitioned with PyArrow dataset API
         try:
-            tbl = events_lazy.collect(streaming=True).to_arrow()
+            tbl = events_lazy.collect().to_arrow()
             import pyarrow.dataset as pds
             pds.write_dataset(
                 tbl,
