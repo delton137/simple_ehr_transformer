@@ -9,19 +9,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import numpy as np
 import logging
 import argparse
 from tqdm import tqdm
 import time
-import json
-from pathlib import Path
-import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 from config import model_config, data_config
-from data_processor import EHRDataProcessor
 from data_loader import PHTDataProcessor, analyze_data_distribution
 from transformer_model import create_ethos_model
 
