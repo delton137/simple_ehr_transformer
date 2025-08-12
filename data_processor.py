@@ -94,32 +94,41 @@ class OMOPDataProcessor:
                     # Try different loading methods for All of Us data
                     df = None
                     
-                    # Method 1: Try pandas read_parquet (handles custom types better)
+                    # Method 1: Try custom dbdate handler first
                     try:
-                        df = pd.read_parquet(file_path, engine='pyarrow')
-                        logger.info(f"Successfully loaded with pandas read_parquet")
+                        df = self._load_with_dbdate_handler(file_path)
+                        if df is not None:
+                            logger.info(f"Successfully loaded with custom dbdate handler")
                     except Exception as e1:
-                        logger.info(f"pandas read_parquet failed: {e1}")
+                        logger.info(f"Custom dbdate handler failed: {e1}")
                         
-                        # Method 2: Try pyarrow with specific options
+                        # Method 2: Try pandas read_parquet (handles custom types better)
                         try:
-                            import pyarrow.parquet as pq
-                            table = pq.read_table(file_path, use_threads=True)
-                            df = table.to_pandas()
-                            logger.info(f"Successfully loaded with pyarrow read_table")
+                            df = pd.read_parquet(file_path, engine='pyarrow')
+                            logger.info(f"Successfully loaded with pandas read_parquet")
                         except Exception as e2:
-                            logger.info(f"pyarrow read_table failed: {e2}")
+                            logger.info(f"pandas read_parquet failed: {e2}")
                             
-                            # Method 3: Try with fastparquet engine
+                            # Method 3: Try pyarrow with specific options
                             try:
-                                df = pd.read_parquet(file_path, engine='fastparquet')
-                                logger.info(f"Successfully loaded with fastparquet engine")
+                                import pyarrow.parquet as pq
+                                table = pq.read_table(file_path, use_threads=True)
+                                df = table.to_pandas()
+                                logger.info(f"Successfully loaded with pyarrow read_table")
                             except Exception as e3:
-                                logger.error(f"All loading methods failed for {file_path}")
-                                logger.error(f"  pandas: {e1}")
-                                logger.error(f"  pyarrow: {e2}")
-                                logger.error(f"  fastparquet: {e3}")
-                                continue
+                                logger.info(f"pyarrow read_table failed: {e3}")
+                                
+                                # Method 4: Try with fastparquet engine
+                                try:
+                                    df = pd.read_parquet(file_path, engine='fastparquet')
+                                    logger.info(f"Successfully loaded with fastparquet engine")
+                                except Exception as e4:
+                                    logger.error(f"All loading methods failed for {file_path}")
+                                    logger.error(f"  custom dbdate: {e1}")
+                                    logger.error(f"  pandas: {e2}")
+                                    logger.error(f"  pyarrow: {e3}")
+                                    logger.error(f"  fastparquet: {e4}")
+                                    continue
                     
                     if df is not None:
                         logger.info(f"Loaded {len(df)} rows from {os.path.basename(file_path)}")
@@ -151,13 +160,85 @@ class OMOPDataProcessor:
                 del combined_chunk, chunk_data
                 gc.collect()
     
+    def _load_with_dbdate_handler(self, file_path: str) -> pd.DataFrame:
+        """Custom loader for All of Us dbdate format"""
+        try:
+            import pyarrow.parquet as pq
+            import pyarrow as pa
+            
+            # Read the parquet file metadata first
+            parquet_file = pq.ParquetFile(file_path)
+            schema = parquet_file.schema
+            
+            # Check if we have dbdate columns
+            dbdate_columns = []
+            for field in schema:
+                if str(field.type) == 'dbdate':
+                    dbdate_columns.append(field.name)
+            
+            if not dbdate_columns:
+                logger.info("No dbdate columns found, using standard loading")
+                return None
+            
+            logger.info(f"Found dbdate columns: {dbdate_columns}")
+            
+            # Read the raw data as bytes to handle custom types
+            table = pq.read_table(file_path, use_threads=True)
+            
+            # Convert dbdate columns to datetime
+            df = table.to_pandas()
+            
+            for col in dbdate_columns:
+                if col in df.columns:
+                    logger.info(f"Converting dbdate column: {col}")
+                    # Convert dbdate to datetime - dbdate is often stored as integer days since epoch
+                    try:
+                        # Try to convert as integer days since epoch
+                        df[col] = pd.to_datetime(df[col], unit='D', errors='coerce')
+                        logger.info(f"Converted {col} from days since epoch")
+                    except:
+                        try:
+                            # Try to convert as integer seconds since epoch
+                            df[col] = pd.to_datetime(df[col], unit='s', errors='coerce')
+                            logger.info(f"Converted {col} from seconds since epoch")
+                        except:
+                            try:
+                                # Try to convert as integer milliseconds since epoch
+                                df[col] = pd.to_datetime(df[col], unit='ms', errors='coerce')
+                                logger.info(f"Converted {col} from milliseconds since epoch")
+                            except:
+                                # Last resort: try to parse as string
+                                logger.warning(f"Could not convert {col} from numeric format, trying string parsing")
+                                df[col] = pd.to_datetime(df[col], errors='coerce')
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error in custom dbdate handler: {e}")
+            return None
+    
     def _fix_all_of_us_data_types(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
         """Fix All of Us specific data type issues"""
         logger.info(f"Fixing data types for {table_name} table")
         
+        # Columns that should NOT be converted (keep as strings)
+        preserve_as_strings = [
+            'person_source_value', 'gender_source_value', 'race_source_value', 
+            'ethnicity_source_value', 'state_of_residence_source_value', 
+            'sex_at_birth_source_value', 'self_reported_category_source_value',
+            'visit_source_value', 'condition_source_value', 'drug_source_value',
+            'procedure_source_value', 'measurement_source_value', 'observation_source_value',
+            'death_source_value', 'note_source_value', 'specimen_source_value'
+        ]
+        
         # Convert problematic columns
         for col in df.columns:
             if df[col].dtype == 'object':
+                # Skip columns that should remain as strings
+                if col in preserve_as_strings:
+                    logger.info(f"Preserving {col} as string (source value column)")
+                    continue
+                
                 # Try to convert to datetime if it looks like a date
                 if any(keyword in col.lower() for keyword in ['date', 'time', 'start', 'end']):
                     try:
@@ -167,8 +248,8 @@ class OMOPDataProcessor:
                     except Exception as e:
                         logger.info(f"Could not convert {col} to datetime: {e}")
                 
-                # Try to convert to numeric if it looks like a number
-                elif any(keyword in col.lower() for keyword in ['id', 'concept', 'value', 'count']):
+                # Try to convert to numeric if it looks like a number (but not source values)
+                elif any(keyword in col.lower() for keyword in ['id', 'concept', 'value', 'count']) and 'source' not in col.lower():
                     try:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                         logger.info(f"Converted {col} to numeric")
