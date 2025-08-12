@@ -573,9 +573,11 @@ class OMOPDataProcessor:
         age_ranges.append((100, 120))  # 100+ years
         
         for i, (start, end) in enumerate(age_ranges):
-            self.age_mappings[f"{start}-{end}"] = i
+            age_interval = f"{start}-{end}"
+            self.age_mappings[age_interval] = i
         
         logger.info(f"Created {len(self.age_mappings)} age interval mappings")
+        logger.info(f"Age intervals: {list(self.age_mappings.keys())[:5]}...")  # Show first 5 for debugging
     
     def create_time_interval_mappings(self):
         """Create time interval mappings"""
@@ -762,11 +764,24 @@ class OMOPDataProcessor:
     
     def _get_age_interval(self, age: float) -> str:
         """Get age interval string"""
-        for start, end in self.age_mappings.keys():
-            start_age, end_age = map(int, start.split('-'))
-            if start_age <= age < end_age:
-                return f"{start_age}-{end_age}"
-        return "100-120"  # Default for very old patients
+        for age_interval in self.age_mappings.keys():
+            try:
+                # Parse age interval string like "0-5", "5-10", etc.
+                if '-' in age_interval:
+                    start_age, end_age = map(int, age_interval.split('-'))
+                    if start_age <= age < end_age:
+                        return age_interval
+                else:
+                    # Handle single age values if they exist
+                    single_age = int(age_interval)
+                    if age == single_age:
+                        return age_interval
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Could not parse age interval '{age_interval}': {e}")
+                continue
+        
+        # Default for very old patients
+        return "100-120"
     
     def _get_year_interval(self, year: int) -> str:
         """Get year interval string (5-year intervals)"""
