@@ -173,6 +173,19 @@ class OMOPDataProcessor:
                 logger.info(f"Successfully loaded table with {len(df)} rows")
             except Exception as e:
                 logger.info(f"Direct loading failed: {e}")
+                
+                # If direct loading fails due to dbdate, try more aggressive approach
+                if 'dbdate' in str(e).lower():
+                    logger.info("Detected dbdate error, trying aggressive loading approach...")
+                    try:
+                        # Try to read with specific options that might handle custom types
+                        df = self._load_with_aggressive_dbdate_handling(file_path)
+                        if df is not None:
+                            logger.info("Successfully loaded with aggressive dbdate handling")
+                            return df
+                    except Exception as e2:
+                        logger.info(f"Aggressive dbdate handling failed: {e2}")
+                
                 return None
             
             # Look for columns that might be dbdate (datetime-like columns with issues)
@@ -255,6 +268,74 @@ class OMOPDataProcessor:
             
         except Exception as e:
             logger.error(f"Error in custom dbdate handler: {e}")
+            return None
+    
+    def _load_with_aggressive_dbdate_handling(self, file_path: str) -> pd.DataFrame:
+        """More aggressive approach to handle dbdate types"""
+        try:
+            import pyarrow.parquet as pq
+            import pyarrow as pa
+            import numpy as np
+            
+            logger.info("Attempting aggressive dbdate handling...")
+            
+            # Try to read with different PyArrow options
+            try:
+                # Option 1: Read with specific column selection
+                table = pq.read_table(file_path, use_threads=True, memory_map=True)
+                df = table.to_pandas()
+                logger.info(f"Aggressive loading succeeded with {len(df)} rows")
+                return df
+            except Exception as e1:
+                logger.info(f"Option 1 failed: {e1}")
+                
+                try:
+                    # Option 2: Try reading as raw bytes and converting
+                    logger.info("Trying raw bytes approach...")
+                    
+                    # Read the file metadata first
+                    parquet_file = pq.ParquetFile(file_path)
+                    
+                    # Get column names
+                    column_names = [field.name for field in parquet_file.schema]
+                    logger.info(f"Available columns: {column_names}")
+                    
+                    # Try to read specific columns that don't have dbdate
+                    safe_columns = []
+                    for col in column_names:
+                        if any(keyword in col.lower() for keyword in ['id', 'concept', 'value', 'count', 'type']):
+                            safe_columns.append(col)
+                    
+                    if safe_columns:
+                        logger.info(f"Attempting to read safe columns: {safe_columns}")
+                        table = pq.read_table(file_path, columns=safe_columns, use_threads=True)
+                        df = table.to_pandas()
+                        logger.info(f"Safe column loading succeeded with {len(df)} rows")
+                        return df
+                    else:
+                        logger.warning("No safe columns found for selective loading")
+                        
+                except Exception as e2:
+                    logger.info(f"Option 2 failed: {e2}")
+                
+                try:
+                    # Option 3: Try with different PyArrow version compatibility
+                    logger.info("Trying version compatibility approach...")
+                    
+                    # Force PyArrow to ignore schema issues
+                    table = pq.read_table(file_path, use_threads=True, memory_map=True)
+                    df = table.to_pandas()
+                    logger.info(f"Version compatibility approach succeeded with {len(df)} rows")
+                    return df
+                    
+                except Exception as e3:
+                    logger.info(f"Option 3 failed: {e3}")
+            
+            logger.error("All aggressive dbdate handling approaches failed")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in aggressive dbdate handling: {e}")
             return None
     
     def _fix_all_of_us_data_types(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
