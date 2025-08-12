@@ -122,7 +122,7 @@ class OMOPDataProcessor:
         obs  = self._scan_table_pl("observation", "observation_datetime", "observation", "observation_concept_id")
         events = pl.concat([cond, drug, proc, meas, obs], how="vertical_relaxed")
         events = (events
-                  .filter(pl.col("ts").is_not_null())
+                  .filter(pl.col("ts").is_not_null() & pl.col("cid").is_not_null())
                   .with_columns([
                       pl.col("ts").cast(pl.Datetime("ns")),
                       (pl.col("person_id") % 1024).cast(pl.Int64).alias("pid_bucket")
@@ -164,7 +164,7 @@ class OMOPDataProcessor:
         df = lf.collect()
         person_data: Dict[int, Dict[str, Any]] = {}
         if df.height:
-            for row in df.iter_rows(named=True):
+            for row in tqdm(df.iter_rows(named=True), total=df.height, desc="[FAST] Demographics", unit="row"):
                 pid = int(row.get("person_id"))
                 birth_dt = row.get("birth_datetime")
                 birth_year = None
@@ -192,12 +192,13 @@ class OMOPDataProcessor:
                   .collect())
         concept_counts: Counter = Counter()
         for et, cid, n in counts.iter_rows():
-            if et in ("condition", "medication", "procedure", "measurement"):
+            if et in ("condition", "medication", "procedure", "measurement", "observation"):
                 prefix = {
                     "condition": "CONDITION_",
                     "medication": "DRUG_",
                     "procedure": "PROCEDURE_",
                     "measurement": "MEASUREMENT_",
+                    "observation": "OBSERVATION_",
                 }[et]
                 concept_counts[f"{prefix}{cid}"] += int(n)
         
@@ -226,7 +227,8 @@ class OMOPDataProcessor:
             logger.error(f"Partitioned events directory not found: {self.events_dir}")
             return tokenized
         # Iterate over pid_bucket partitions and group by person_id inside each file
-        for file in Path(self.events_dir).rglob('*.parquet'):
+        files = list(Path(self.events_dir).rglob('*.parquet'))
+        for file in tqdm(files, desc="[FAST] Tokenizing partitions", unit="file"):
             try:
                 df = pl.read_parquet(str(file))
                 if df.is_empty():
@@ -315,6 +317,27 @@ class OMOPDataProcessor:
             self.vocab[f"TIME_{time_interval}"] = len(self.vocab)
         for i in range(model_config.max_quantile_tokens):
             self.vocab[f"Q{i}"] = len(self.vocab)
+        # Demographic tokens (from person_data)
+        genders = set()
+        races = set()
+        year_intervals = set()
+        for p in person_data.values():
+            g = p.get('gender_concept_id')
+            r = p.get('race_concept_id')
+            by = p.get('birth_year')
+            if g is not None:
+                genders.add(str(g))
+            if r is not None:
+                races.add(str(r))
+            if by is not None:
+                yi = self._get_year_interval(by)
+                year_intervals.add(yi)
+        for g in sorted(genders):
+            self.vocab[f"GENDER_{g}"] = len(self.vocab)
+        for r in sorted(races):
+            self.vocab[f"RACE_{r}"] = len(self.vocab)
+        for yi in sorted(year_intervals):
+            self.vocab[f"YEAR_{yi}"] = len(self.vocab)
         # Add concept tokens up to capacity
         max_concepts = model_config.vocab_size - len(self.vocab)
         for concept, _n in concept_counts.most_common(max_concepts):
@@ -1208,9 +1231,9 @@ class OMOPDataProcessor:
                     event['timestamp']
                 )
                 if time_diff >= model_config.min_time_interval:
-                    interval_token = self._get_time_interval_token(time_diff)
-                    if interval_token is not None:
-                        tokens.append(interval_token)
+                    interval_tokens = self._get_time_interval_tokens(time_diff)
+                    if interval_tokens:
+                        tokens.extend(interval_tokens)
             
             # Add event tokens
             event_tokens = self._tokenize_event(event)
@@ -1339,41 +1362,44 @@ class OMOPDataProcessor:
         diff = time2 - time1
         return diff.total_seconds() / 60
     
-    def _get_time_interval_token(self, minutes: float) -> Optional[int]:
-        """Get time interval token for given minutes"""
+    def _get_time_interval_tokens(self, minutes: float) -> List[int]:
+        """Return time-interval token ids per ETHOS rules.
+        - No token if minutes < 5m (min_time_interval)
+        - If minutes > 1y, emit multiple 6m tokens, rounding count
+        - Else emit single closest bucket among the 13 bins
+        """
         if minutes < model_config.min_time_interval:
-            return None
-        
-        # Find the closest interval
-        for label, token_id in self.time_interval_mappings.items():
-            if label == "1y" and minutes >= 525600:
-                return token_id
-            elif label == "6m" and 259200 <= minutes < 525600:
-                return token_id
-            elif label == "3m" and 129600 <= minutes < 259200:
-                return token_id
-            elif label == "1m" and 43200 <= minutes < 129600:
-                return token_id
-            elif label == "1w" and 10080 <= minutes < 43200:
-                return token_id
-            elif label == "3d" and 4320 <= minutes < 10080:
-                return token_id
-            elif label == "1d" and 1440 <= minutes < 4320:
-                return token_id
-            elif label == "12h" and 720 <= minutes < 1440:
-                return token_id
-            elif label == "6h" and 360 <= minutes < 720:
-                return token_id
-            elif label == "3h" and 180 <= minutes < 360:
-                return token_id
-            elif label == "1h" and 60 <= minutes < 180:
-                return token_id
-            elif label == "15m" and 15 <= minutes < 60:
-                return token_id
-            elif label == "5m" and 5 <= minutes < 15:
-                return token_id
-        
-        return None
+            return []
+        six_months = 259200  # minutes
+        one_year = 525600
+        if minutes > one_year:
+            n = max(2, int(round(minutes / six_months)))
+            sixm_token = self.vocab.get("TIME_6m")
+            if sixm_token is None:
+                sixm_token = self.time_interval_mappings.get("6m")
+            return [sixm_token] * n if sixm_token is not None else []
+        buckets = [
+            (one_year, "1y"),
+            (259200, "6m"),
+            (129600, "3m"),
+            (43200, "1m"),
+            (10080, "1w"),
+            (4320, "3d"),
+            (1440, "1d"),
+            (720, "12h"),
+            (360, "6h"),
+            (180, "3h"),
+            (60, "1h"),
+            (15, "15m"),
+            (5, "5m"),
+        ]
+        for threshold, label in buckets:
+            if minutes >= threshold:
+                token_id = self.vocab.get(f"TIME_{label}")
+                if token_id is None:
+                    token_id = self.time_interval_mappings.get(label)
+                return [token_id] if token_id is not None else []
+        return []
     
     def process_all_data(self) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
         """Process all OMOP data and return tokenized timelines and vocabulary"""
@@ -1411,6 +1437,7 @@ class OMOPDataProcessor:
         patient_ids = list(patient_timelines.keys())
         chunk_size = data_config.max_patients_per_chunk
         logger.info(f"Tokenizing {len(patient_ids)} patient timelines in chunks of {chunk_size}")
+        pbar = tqdm(total=len(patient_ids), desc="Tokenizing timelines", unit="pt")
         for i in range(0, len(patient_ids), chunk_size):
             chunk_ids = patient_ids[i:i + chunk_size]
             logger.info(f"Processing chunk {i//chunk_size + 1}/{(len(patient_ids) + chunk_size - 1)//chunk_size}")
@@ -1429,7 +1456,9 @@ class OMOPDataProcessor:
                     patient_age = 50
                 tokens = self.tokenize_timeline(timeline, patient_age)
                 tokenized_timelines[patient_id] = tokens
+                pbar.update(1)
             gc.collect()
+        pbar.close()
         self._save_processed_data(tokenized_timelines, patient_timelines)
         return tokenized_timelines, self.vocab
     
