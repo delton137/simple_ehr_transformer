@@ -330,6 +330,69 @@ class OMOPDataProcessor:
                     
                 except Exception as e3:
                     logger.info(f"Option 3 failed: {e3}")
+                
+                try:
+                    # Option 4: Try reading with pandas and pyarrow fallback
+                    logger.info("Trying pandas with pyarrow fallback...")
+                    
+                    # Try pandas first
+                    df = pd.read_parquet(file_path, engine='pyarrow')
+                    logger.info(f"Pandas with pyarrow succeeded with {len(df)} rows")
+                    return df
+                    
+                except Exception as e4:
+                    logger.info(f"Option 4 failed: {e4}")
+                
+                try:
+                    # Option 5: Try reading with fastparquet engine
+                    logger.info("Trying fastparquet engine...")
+                    
+                    df = pd.read_parquet(file_path, engine='fastparquet')
+                    logger.info(f"Fastparquet engine succeeded with {len(df)} rows")
+                    return df
+                    
+                except Exception as e5:
+                    logger.info(f"Option 5 failed: {e5}")
+                
+                try:
+                    # Option 6: Try reading with pyarrow and ignore schema
+                    logger.info("Trying pyarrow with schema override...")
+                    
+                    # Read the file and try to handle dbdate columns manually
+                    table = pq.read_table(file_path, use_threads=True)
+                    
+                    # Convert to pandas and handle dbdate columns
+                    df = table.to_pandas()
+                    
+                    # Look for columns that might be dbdate and convert them
+                    for col in df.columns:
+                        if df[col].dtype == 'object':
+                            if any(keyword in col.lower() for keyword in ['date', 'time', 'start', 'end']):
+                                logger.info(f"Converting potential dbdate column: {col}")
+                                try:
+                                    # Try to convert as integer days since epoch
+                                    df[col] = pd.to_datetime(df[col], unit='D', errors='coerce')
+                                    logger.info(f"Converted {col} from days since epoch")
+                                except:
+                                    try:
+                                        # Try to convert as integer seconds since epoch
+                                        df[col] = pd.to_datetime(df[col], unit='s', errors='coerce')
+                                        logger.info(f"Converted {col} from seconds since epoch")
+                                    except:
+                                        try:
+                                            # Try to convert as integer milliseconds since epoch
+                                            df[col] = pd.to_datetime(df[col], unit='ms', errors='coerce')
+                                            logger.info(f"Converted {col} from milliseconds since epoch")
+                                        except:
+                                            # Last resort: try to parse as string
+                                            logger.warning(f"Could not convert {col} from numeric format, trying string parsing")
+                                            df[col] = pd.to_datetime(df[col], errors='coerce')
+                    
+                    logger.info(f"Schema override approach succeeded with {len(df)} rows")
+                    return df
+                    
+                except Exception as e6:
+                    logger.info(f"Option 6 failed: {e6}")
             
             logger.error("All aggressive dbdate handling approaches failed")
             return None
