@@ -15,6 +15,7 @@ from tqdm import tqdm
 import time
 import matplotlib.pyplot as plt
 from typing import Optional
+import math
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -57,12 +58,19 @@ class ETHOSTrainer:
             weight_decay=0.01
         )
         
-        # Learning rate scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=len(train_loader) * config['max_epochs'],
-            eta_min=1e-6
-        )
+        # Learning rate scheduler: Linear warmup -> Cosine decay
+        self.warmup_steps: int = int(config.get('warmup_steps', 2000))
+        self.steps_per_epoch: int = max(1, math.ceil(len(train_loader) / self.grad_accum_steps))
+        self.total_steps: int = self.steps_per_epoch * int(config['max_epochs'])
+
+        def lr_lambda(step: int):
+            if step < self.warmup_steps:
+                return float(step) / max(1, self.warmup_steps)
+            progress = float(step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        from torch.optim.lr_scheduler import LambdaLR
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         
         # AMP scaler
         self.scaler: Optional[torch.cuda.amp.GradScaler]
@@ -77,6 +85,7 @@ class ETHOSTrainer:
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
+        self.log_every: int = int(config.get('log_every', 200))
         
         # Create output directories
         os.makedirs(self.model_dir, exist_ok=True)
@@ -89,9 +98,9 @@ class ETHOSTrainer:
         total_loss = 0
         num_batches = 0
         
-        progress_bar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch + 1}') if self.rank == 0 else self.train_loader
-        
-        for batch_idx, (input_ids, target_ids) in enumerate(progress_bar):
+        running_loss = 0.0
+        running_count = 0
+        for batch_idx, (input_ids, target_ids) in enumerate(self.train_loader):
             # Move to device
             input_ids = input_ids.to(self.device, non_blocking=True)
             target_ids = target_ids.to(self.device, non_blocking=True)
@@ -141,17 +150,23 @@ class ETHOSTrainer:
                 self.scheduler.step()
             
             # Update metrics
-            total_loss += loss.item() * self.grad_accum_steps
+            step_loss = loss.item() * self.grad_accum_steps
+            total_loss += step_loss
+            running_loss += step_loss
+            running_count += 1
             num_batches += 1
-            
-            if self.rank == 0 and isinstance(progress_bar, tqdm):
-                progress_bar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'lr': f'{self.scheduler.get_last_lr()[0]:.2e}'
-                })
-            
             # Log learning rate
             self.learning_rates.append(self.scheduler.get_last_lr()[0])
+
+            # Periodic logging (no tqdm)
+            if self.rank == 0 and ((batch_idx + 1) % self.log_every == 0):
+                avg_running = running_loss / max(1, running_count)
+                logger.info(
+                    f"Epoch {self.current_epoch + 1} | Step {batch_idx + 1}/{len(self.train_loader)} | "
+                    f"Loss: {avg_running:.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e}"
+                )
+                running_loss = 0.0
+                running_count = 0
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return avg_loss
@@ -163,7 +178,7 @@ class ETHOSTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for input_ids, target_ids in (tqdm(self.val_loader, desc='Validation') if self.rank == 0 else self.val_loader):
+            for input_ids, target_ids in self.val_loader:
                 # Move to device
                 input_ids = input_ids.to(self.device, non_blocking=True)
                 target_ids = target_ids.to(self.device, non_blocking=True)
@@ -352,6 +367,8 @@ def main():
                        help='Max sequence length per sample (default: 1024)')
     parser.add_argument('--use_amp', action='store_true', help='Enable mixed precision (AMP). If omitted and CUDA is available, AMP will be auto-enabled.')
     parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps (default: 4)')
+    parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
+    parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
     parser.add_argument('--print_timeline_stats', action='store_true',
                        help='Print train/val patient counts and training timeline length histogram before training')
@@ -599,6 +616,7 @@ def main():
             'gradient_clip': model_config.gradient_clip,
             'use_amp': args.use_amp,
             'grad_accum_steps': args.grad_accum_steps,
+            'warmup_steps': args.warmup_steps,
         }
         # Determine model output directory (tag-aware)
         model_dir = os.path.join('models', args.tag) if args.tag else 'models'
