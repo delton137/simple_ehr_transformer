@@ -243,7 +243,8 @@ class OMOPDataProcessor:
                 bucket_dir.mkdir(parents=True, exist_ok=True)
                 # Name per-bucket file
                 out_path = bucket_dir / 'part-000000.parquet'
-                part.drop_in_place('pid_bucket', True) if 'pid_bucket' in part.columns else None
+                if 'pid_bucket' in part.columns:
+                    part = part.drop('pid_bucket')
                 part.write_parquet(str(out_path))
             logger.info("[FAST] Events written (partitioned by pid_bucket)")
         except Exception as e:
