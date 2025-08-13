@@ -386,7 +386,7 @@ class ETHOSTrainer:
             return True
             
 
-!-------------------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------------------
     def train(self, resume_from: str = None):
         """Main training loop with automatic checkpoint detection"""
 
