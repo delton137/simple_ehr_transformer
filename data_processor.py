@@ -384,14 +384,21 @@ class OMOPDataProcessor:
                 local_tokenized[pid] = tokens
             return local_tokenized
 
-        # Parallel over files when many CPUs are available
+        # Parallel over files using threads (avoids pickling issues; Polars releases GIL)
         if self.num_workers and self.num_workers > 1:
-            logger.info(f"[FAST] Parallel tokenization using {self.num_workers} workers")
-            from multiprocessing import Pool
-            with Pool(processes=self.num_workers) as pool:
-                for result in tqdm(pool.imap_unordered(process_file, files), total=len(files), desc='[FAST] Tokenizing partitions', unit='file'):
-                    if result:
-                        tokenized.update(result)
+            logger.info(f"[FAST] Parallel tokenization using {self.num_workers} threads")
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
+                futures = {ex.submit(process_file, f): f for f in files}
+                for fut in tqdm(as_completed(futures), total=len(files), desc='[FAST] Tokenizing partitions', unit='file'):
+                    file = futures[fut]
+                    try:
+                        result = fut.result()
+                        if result:
+                            tokenized.update(result)
+                    except Exception as e:
+                        logger.warning(f"Tokenization failed for {file}: {e}")
+                        continue
         else:
             for file in tqdm(files, desc='[FAST] Tokenizing partitions', unit='file'):
                 try:
