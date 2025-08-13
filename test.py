@@ -87,6 +87,7 @@ class FutureTester:
         top_k: int = 50,
         top_p: float = 0.9,
         patient_limit: Optional[int] = None,
+        vocab_path: Optional[str] = None,
     ) -> None:
         self.forward_horizon_days = forward_horizon_days
         self.num_samples = num_samples
@@ -102,8 +103,38 @@ class FutureTester:
         else:
             self.device = torch.device(device)
 
-        # Load vocab and id mapping from current data
-        with open(os.path.join(current_data_dir, "vocabulary.pkl"), "rb") as f:
+        # Load checkpoint first to know its expected vocab size
+        checkpoint = torch.load(model_path, map_location=self.device)
+        ckpt_state = checkpoint.get("model_state_dict", {})
+        ckpt_vocab_size: Optional[int] = None
+        try:
+            ckpt_vocab_size = int(ckpt_state["token_embedding.weight"].size(0))  # type: ignore[index]
+        except Exception:
+            ckpt_vocab_size = None
+
+        # Resolve vocabulary path preference:
+        # 1) explicit --vocab_path
+        # 2) vocabulary.pkl next to checkpoint
+        # 3) vocabulary.pkl in current_data_dir (fallback)
+        vocab_candidates = []
+        if vocab_path:
+            vocab_candidates.append(vocab_path)
+        model_dir = os.path.dirname(model_path)
+        vocab_candidates.append(os.path.join(model_dir, "vocabulary.pkl"))
+        vocab_candidates.append(os.path.join(current_data_dir, "vocabulary.pkl"))
+
+        chosen_vocab_path: Optional[str] = None
+        for vp in vocab_candidates:
+            if vp and os.path.exists(vp):
+                chosen_vocab_path = vp
+                break
+
+        if chosen_vocab_path is None:
+            raise FileNotFoundError(
+                "Could not find a vocabulary.pkl. Provide --vocab_path, or place vocabulary.pkl next to the checkpoint, or ensure it exists in current_data_dir."
+            )
+
+        with open(chosen_vocab_path, "rb") as f:
             import pickle
             self.vocab: Dict[str, int] = pickle.load(f)
         self.id_to_token = {tid: name for name, tid in self.vocab.items()}
@@ -122,10 +153,37 @@ class FutureTester:
                     import pickle
                     self.future_timelines = pickle.load(f)
 
-        # Load model
-        checkpoint = torch.load(model_path, map_location=self.device)
+        # Load model and adapt checkpoint to current vocab size if needed
         self.model = create_ethos_model(len(self.vocab))
-        self.model.load_state_dict(checkpoint["model_state_dict"])  # type: ignore[index]
+        state_dict = checkpoint.get("model_state_dict", {})
+        if ckpt_vocab_size is not None and ckpt_vocab_size != len(self.vocab):
+            # Adapt embedding and output layers by copying overlapping rows/cols
+            model_state = self.model.state_dict()
+            def _resize_param(key: str) -> None:
+                if key not in state_dict or key not in model_state:
+                    return
+                src = state_dict[key]
+                dst = model_state[key]
+                if src.shape == dst.shape:
+                    return
+                new_param = dst.clone()
+                # Handle 2D and 1D tensors
+                if src.dim() == 2 and dst.dim() == 2:
+                    rows = min(src.size(0), dst.size(0))
+                    cols = min(src.size(1), dst.size(1))
+                    new_param[:rows, :cols] = src[:rows, :cols]
+                elif src.dim() == 1 and dst.dim() == 1:
+                    n = min(src.size(0), dst.size(0))
+                    new_param[:n] = src[:n]
+                else:
+                    # Fallback: if dims differ, skip
+                    return
+                state_dict[key] = new_param
+
+            _resize_param("token_embedding.weight")
+            _resize_param("output_projection.weight")
+            _resize_param("output_projection.bias")
+        self.model.load_state_dict(state_dict, strict=False)  # type: ignore[arg-type]
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -412,6 +470,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
+    p.add_argument("--vocab_path", type=str, default=None, help="Optional explicit path to vocabulary.pkl matching the checkpoint")
     return p.parse_args()
 
 
@@ -430,6 +489,7 @@ def main() -> None:
         top_k=args.top_k,
         top_p=args.top_p,
         patient_limit=args.patient_limit,
+        vocab_path=args.vocab_path,
     )
     # Run simulation and compute AUROC for tokens_to_predict using future data
     pids = list(tester.current_timelines.keys())
