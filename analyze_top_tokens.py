@@ -23,6 +23,7 @@ from typing import Dict, List, Tuple, Optional
 from collections import Counter
 
 import pandas as pd
+from tqdm import tqdm
 
 from config import data_config
 
@@ -51,7 +52,8 @@ def invert_vocab(vocab: Dict[str, int]) -> Dict[int, str]:
 
 def count_token_frequencies(tokenized_timelines: Dict[int, List[int]]) -> Counter:
     counts: Counter = Counter()
-    for tokens in tokenized_timelines.values():
+    print("Counting token frequencies...")
+    for tokens in tqdm(tokenized_timelines.values(), desc="Processing timelines", unit="patient"):
         counts.update(tokens)
     return counts
 
@@ -77,8 +79,9 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
     files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
     if not files:
         return None
+    print(f"Loading concept table from {len(files)} parquet files...")
     dfs: List[pd.DataFrame] = []
-    for fp in files:
+    for fp in tqdm(files, desc="Loading concept files", unit="file"):
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
             dfs.append(df)
@@ -90,6 +93,7 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
                 continue
     if not dfs:
         return None
+    print("Concatenating concept data...")
     df_all = pd.concat(dfs, ignore_index=True)
     # Keep relevant columns if present
     keep_cols = [
@@ -107,8 +111,9 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
     files = [os.path.join(rel_dir, f) for f in os.listdir(rel_dir) if f.endswith('.parquet')]
     if not files:
         return None
+    print(f"Loading concept relationship table from {len(files)} parquet files...")
     dfs: List[pd.DataFrame] = []
-    for fp in files:
+    for fp in tqdm(files, desc="Loading relationship files", unit="file"):
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
             dfs.append(df)
@@ -120,6 +125,7 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
                 continue
     if not dfs:
         return None
+    print("Concatenating relationship data...")
     df_all = pd.concat(dfs, ignore_index=True)
     # Normalize column names
     expected = {'concept_id_1', 'concept_id_2', 'relationship_id'}
@@ -129,8 +135,10 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
 
 
 def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.DataFrame], rel_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    print(f"Mapping {len(concept_ids)} concepts to standard concepts...")
     ci_df = pd.DataFrame({'concept_id': concept_ids}).drop_duplicates()
     if rel_df is not None:
+        print("Applying 'Maps to' relationships...")
         maps_to = rel_df[rel_df['relationship_id'] == 'Maps to'][['concept_id_1', 'concept_id_2']].drop_duplicates()
         ci_df = ci_df.merge(maps_to, how='left', left_on='concept_id', right_on='concept_id_1')
         ci_df['standard_id'] = ci_df['concept_id_2'].fillna(ci_df['concept_id'])
@@ -138,6 +146,7 @@ def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.Data
     else:
         ci_df['standard_id'] = ci_df['concept_id']
     if concept_df is not None:
+        print("Joining concept metadata...")
         concept_cols = ['concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
         # Join on standard_id for final interpretation
         ci_df = ci_df.merge(concept_df.rename(columns={'concept_id': 'standard_id'}), how='left', on='standard_id')
@@ -157,9 +166,10 @@ def build_top_table(
     top_k: int,
     concept_only: bool,
 ) -> pd.DataFrame:
+    print(f"Building top {top_k} tokens table...")
     # Build list of (token_id, token_str, count)
     rows: List[Tuple[int, str, int]] = []
-    for tid, cnt in counts.items():
+    for tid, cnt in tqdm(counts.items(), desc="Processing token counts", unit="token"):
         token_str = id_to_token.get(tid)
         if token_str is None:
             continue
@@ -169,12 +179,14 @@ def build_top_table(
     if not rows:
         return pd.DataFrame(columns=['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation', 'concept_id', 'domain_id', 'vocabulary_id', 'concept_code'])
 
+    print("Creating DataFrame and calculating frequencies...")
     df = pd.DataFrame(rows, columns=['token_id', 'token', 'raw_count'])
     df = df.sort_values('raw_count', ascending=False)
     total = df['raw_count'].sum()
     df['frequency_percent'] = (df['raw_count'] / max(1, total)) * 100.0
 
     # Extract OMOP concept ids when applicable
+    print("Extracting concept IDs from tokens...")
     parsed = df['token'].apply(parse_token)
     df['prefix'] = parsed.apply(lambda x: x[0])
     df['concept_id'] = parsed.apply(lambda x: x[1])
@@ -195,6 +207,7 @@ def build_top_table(
     # For tokens without OMOP concept, provide a readable interpretation
     missing_interp = df['interpretation'].isna()
     if missing_interp.any():
+        print("Adding fallback interpretations for non-concept tokens...")
         def fallback_interp(tok: str) -> str:
             if tok.startswith('AGE_'):
                 return f"Age interval {tok[len('AGE_') : ]} years"
@@ -217,6 +230,7 @@ def build_top_table(
         df.loc[missing_interp, 'interpretation'] = df.loc[missing_interp, 'token'].apply(fallback_interp)
 
     # Final sort and trim to top_k
+    print(f"Finalizing top {top_k} tokens...")
     df = df[['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation', 'concept_id', 'domain_id', 'vocabulary_id', 'concept_code']]
     df = df.sort_values('raw_count', ascending=False).head(top_k).reset_index(drop=True)
     return df
@@ -245,13 +259,25 @@ def main():
     omop_dir = args.omop_dir or data_config.omop_data_dir
 
     # Load processed data
+    print("Loading processed data...")
     tokenized_timelines, vocab = load_processed_data(data_dir)
     id_to_token = invert_vocab(vocab)
+    print(f"Loaded {len(tokenized_timelines)} patient timelines with {len(vocab)} vocabulary tokens")
+    
+    print("Counting token frequencies...")
     counts = count_token_frequencies(tokenized_timelines)
 
     # Load OMOP concept tables (best-effort)
+    print("Loading OMOP concept tables...")
     concept_df = read_concept_table(omop_dir)
     rel_df = read_concept_relationship_table(omop_dir)
+    
+    if concept_df is not None:
+        print(f"Loaded concept table with {len(concept_df)} concepts")
+    if rel_df is not None:
+        print(f"Loaded relationship table with {len(rel_df)} relationships")
+    if concept_df is None and rel_df is None:
+        print("No OMOP concept tables found - will use fallback interpretations")
 
     # Build table
     table = build_top_table(
