@@ -431,47 +431,25 @@ def build_top_table(
     df['prefix'] = parsed.apply(lambda x: x[0])
     df['concept_code'] = parsed.apply(lambda x: x[1])  # This is actually the concept_code, not concept_id
     
+    # Initialize concept_name column
+    df['concept_name'] = None
+    
     # Map concept codes to concept names using OMOP concept table
     has_concepts = df['concept_code'].notna()
     if has_concepts.any() and concept_parquet_path:
-        print(f"Using Polars-based concept lookup for concept codes...")
+        print(f"Using Polars-based concept lookup for top {len(df)} tokens...")
         concept_codes = df.loc[has_concepts, 'concept_code'].astype(int).tolist()
-        print(f"Found {len(concept_codes)} concept codes to map")
+        print(f"Found {len(concept_codes)} concept codes to map (only for top {len(df)} tokens)")
         
-        # Use the get_concept_name function for each concept code
-        print("Looking up concept names...")
-        for idx, row in df[has_concepts].iterrows():
-            concept_code = int(row['concept_code'])
-            token = row['token']
-            
-            # Determine table type from token prefix
-            table_type = "UNKNOWN"
-            if token.startswith('CONDITION_'):
-                table_type = "CONDITION"
-            elif token.startswith('DRUG_'):
-                table_type = "DRUG"
-            elif token.startswith('MEASUREMENT_'):
-                table_type = "MEASUREMENT"
-            elif token.startswith('PROCEDURE_'):
-                table_type = "PROCEDURE"
-            elif token.startswith('OBSERVATION_'):
-                table_type = "OBSERVATION"
-            elif token.startswith('VISIT_'):
-                table_type = "VISIT"
-            
-            # Look up concept name
-            concept_name = get_concept_name(
-                table=table_type,
-                concept_id=concept_code,
-                concept_parquet_path=concept_parquet_path
-            )
-            
-            if concept_name:
-                df.loc[idx, 'interpretation'] = concept_name
-                df.loc[idx, 'concept_name'] = concept_name
-            else:
-                # Fallback to token prefix interpretation
-                df.loc[idx, 'interpretation'] = f"{table_type.lower().title()}: Concept {concept_code}"
+        # Use batch lookup for efficiency
+        print("Looking up concept names in batch...")
+        concept_names_dict = get_concept_names_batch(concept_codes, concept_parquet_path)
+        
+        # Map concept names back to DataFrame
+        df['concept_name'] = df['concept_code'].map(concept_names_dict)
+        
+        # Set interpretation to concept_name when available
+        df['interpretation'] = df['concept_name'].fillna(df['interpretation'])
         
         print(f"Successfully mapped concept names for {df['concept_name'].notna().sum()} concepts")
     else:
@@ -674,6 +652,23 @@ def main():
 
     # Resolve omop_dir
     omop_dir = args.omop_dir or data_config.omop_data_dir
+    
+    # For All of Us data, we need the concept table from omop_data_2023
+    # but the processed data might be from a different directory
+    if omop_dir and 'omop_data_one_month' in omop_dir:
+        # Try to find the concept table in the parent directory
+        parent_dir = os.path.dirname(omop_dir)
+        concept_candidate = os.path.join(parent_dir, 'omop_data_2023', 'concept')
+        if os.path.isdir(concept_candidate):
+            print(f"ℹ️  Found concept table in parent directory: {concept_candidate}")
+            omop_dir = os.path.join(parent_dir, 'omop_data_2023')
+        else:
+            print(f"⚠️  No concept table found in {concept_candidate}")
+            print(f"   You may need to specify --omop_dir to point to a directory containing concept/ and concept_relationship/ tables")
+    
+    if not omop_dir:
+        print("⚠️  No OMOP directory specified - will use fallback interpretations only")
+        print("   Use --omop_dir to specify path to OMOP data with concept tables")
 
     # Load processed data
     print("Loading processed data...")
@@ -684,8 +679,7 @@ def main():
     print("Counting token frequencies...")
     counts = count_token_frequencies(tokenized_timelines)
 
-    # Load OMOP concept tables (best-effort)
-    print("Loading OMOP concept tables...")
+    # Try to find concept table parquet file
     concept_parquet_path = None
     if omop_dir:
         concept_dir = os.path.join(omop_dir, 'concept')
@@ -699,22 +693,35 @@ def main():
         else:
             print("⚠️  Concept directory not found")
     
+    # Fallback: try the hardcoded path from user's example
+    if concept_parquet_path is None:
+        fallback_path = "/home/jupyter/workspaces/ehrtransformerbaseline/omop_data_2023/concept/000000000000.parquet"
+        if os.path.exists(fallback_path):
+            concept_parquet_path = fallback_path
+            print(f"✅ Using fallback concept table: {concept_parquet_path}")
+        else:
+            print(f"⚠️  Fallback concept table not found: {fallback_path}")
+    
     if concept_parquet_path:
         print("ℹ️  Will use Polars-based concept lookup for efficient mapping")
     else:
         print("ℹ️  No concept table available - will use fallback interpretations only")
     
-    # Try to load relationship table if available
-    try:
-        rel_df = read_concept_relationship_table(omop_dir)
-        if rel_df is not None:
-            print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
-            print(f"   Available columns: {list(rel_df.columns)}")
-        else:
-            print("⚠️  No relationship table available")
-    except Exception as e:
-        print(f"⚠️  Failed to load relationship table: {e}")
-        print("Will continue without relationship data")
+    # Try to load relationship table if available (optional - not needed for basic concept mapping)
+    rel_df = None
+    if omop_dir and os.path.exists(os.path.join(omop_dir, 'concept_relationship')):
+        try:
+            rel_df = read_concept_relationship_table(omop_dir)
+            if rel_df is not None:
+                print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
+                print(f"   Available columns: {list(rel_df.columns)}")
+            else:
+                print("⚠️  No relationship table available")
+        except Exception as e:
+            print(f"⚠️  Failed to load relationship table: {e}")
+            print("Will continue without relationship data")
+    else:
+        print("ℹ️  No relationship table found - will continue without it")
     
     if concept_parquet_path is None and rel_df is None:
         print("ℹ️  Running with fallback interpretations only - no OMOP concept data available")
