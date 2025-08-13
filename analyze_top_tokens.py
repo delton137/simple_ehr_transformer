@@ -702,22 +702,41 @@ def main():
         concept_parquet_path=concept_parquet_path,
         rel_df=rel_df,
         top_k=args.top_k,
-        concept_only=(not args.include_misc),
+        concept_only=not args.include_misc,
     )
 
-    # Output CSV
-    out_csv = args.output_csv or os.path.join(data_dir, 'top_tokens.csv')
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    table.to_csv(out_csv, index=False)
+    # Display preview
+    print(f"\n📋 Top {min(10, len(table))} Tokens Preview:")
+    preview_cols = ['token', 'raw_count', 'frequency_percent', 'interpretation']
+    available_preview_cols = [col for col in preview_cols if col in table.columns]
+    
+    with pd.option_context('display.max_colwidth', 50, 'display.width', 120):
+        print(table[available_preview_cols].head(10).to_string(index=False))
+    
+    if len(table) > 10:
+        print(f"... and {len(table) - 10} more tokens")
 
-    # Print a brief preview
-    print(f"Saved top {len(table)} tokens to {out_csv}")
-    try:
-        preview = table.head(min(20, len(table)))
-        with pd.option_context('display.max_colwidth', 80):
-            print(preview)
-    except Exception:
-        pass
+    # Save to CSV
+    output_csv = args.output_csv
+    if output_csv is None:
+        output_csv = os.path.join(data_dir, 'top_tokens.csv')
+    
+    print(f"\n💾 Saving top {args.top_k} tokens to: {output_csv}")
+    table.to_csv(output_csv, index=False)
+    print(f"✅ Successfully saved to: {output_csv}")
+    
+    # Display summary
+    print(f"\n📊 Top {args.top_k} Tokens Summary:")
+    print(f"   Total unique tokens: {len(counts)}")
+    print(f"   Total token occurrences: {sum(counts.values()):,}")
+    print(f"   Top token: {table.iloc[0]['token']} ({table.iloc[0]['raw_count']:,} occurrences, {table.iloc[0]['frequency_percent']:.1f}%)")
+    
+    if 'concept_name' in table.columns and table['concept_name'].notna().any():
+        concept_count = table['concept_name'].notna().sum()
+        print(f"   Concepts with names: {concept_count}/{args.top_k}")
+    
+    print(f"\n🎯 Table saved to: {output_csv}")
+    print(f"📋 You can now use this CSV for your slides/presentations!")
 
 
 if __name__ == '__main__':
