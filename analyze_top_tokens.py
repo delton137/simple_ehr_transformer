@@ -185,51 +185,75 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
 
 def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
     rel_dir = os.path.join(omop_dir, 'concept_relationship')
+    print(f"Looking for relationship directory: {rel_dir}")
     if not os.path.isdir(rel_dir):
-        print(f"Concept relationship directory not found: {rel_dir}")
+        print(f"❌ Concept relationship directory not found: {rel_dir}")
+        print(f"Available directories in {omop_dir}: {os.listdir(omop_dir) if os.path.exists(omop_dir) else 'Directory does not exist'}")
         return None
+    
     files = [os.path.join(rel_dir, f) for f in os.listdir(rel_dir) if f.endswith('.parquet')]
     if not files:
-        print(f"No parquet files found in concept relationship directory: {rel_dir}")
+        print(f"❌ No parquet files found in concept relationship directory: {rel_dir}")
+        print(f"Files in relationship directory: {os.listdir(rel_dir)}")
         return None
+    
     print(f"Loading concept relationship table from {len(files)} parquet files...")
+    print(f"Files: {files}")
     dfs: List[pd.DataFrame] = []
+    
     for fp in tqdm(files, desc="Loading relationship files", unit="file"):
+        print(f"Attempting to load: {fp}")
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
+            print(f"✅ Successfully loaded with pyarrow: {df.shape}")
             dfs.append(df)
         except Exception as e:
-            print(f"Failed to load {fp} with pyarrow: {e}")
+            print(f"❌ Failed to load {fp} with pyarrow: {e}")
             try:
                 df = pd.read_parquet(fp, engine='fastparquet')
+                print(f"✅ Successfully loaded with fastparquet: {df.shape}")
                 dfs.append(df)
             except Exception as e2:
-                print(f"Failed to load {fp} with fastparquet: {e2}")
+                print(f"❌ Failed to load {fp} with fastparquet: {e2}")
                 # Try with manual dbdate handling
                 try:
                     print(f"Attempting to load with manual dbdate conversion...")
                     import pyarrow.parquet as pq
                     table = pq.read_table(fp)
+                    print(f"✅ Successfully read with pyarrow.parquet: {table.shape}")
+                    print(f"Schema: {table.schema}")
+                    
                     # Convert dbdate columns
                     schema = table.schema
                     new_fields = []
                     for field in schema:
                         if str(field.type) == 'dbdate':
                             new_fields.append(pyarrow.field(field.name, pyarrow.timestamp('ns')))
+                            print(f"Converting dbdate field: {field.name}")
                         else:
                             new_fields.append(field)
-                    new_schema = pyarrow.schema(new_fields)
-                    # Cast the table
-                    table = table.cast(new_schema)
+                    
+                    if new_fields != list(schema):
+                        new_schema = pyarrow.schema(new_fields)
+                        print(f"New schema: {new_schema}")
+                        # Cast the table
+                        table = table.cast(new_schema)
+                        print(f"✅ Successfully cast table")
+                    
                     df = table.to_pandas()
-                    print(f"Successfully loaded with dbdate conversion")
+                    print(f"✅ Successfully converted to pandas: {df.shape}")
                     dfs.append(df)
                 except Exception as e3:
-                    print(f"Failed to load with dbdate conversion: {e3}")
+                    print(f"❌ Failed to load with dbdate conversion: {e3}")
+                    import traceback
+                    print("Full stack trace for dbdate conversion:")
+                    traceback.print_exc()
                     continue
+    
     if not dfs:
-        print("No relationship files could be loaded successfully")
+        print("❌ No relationship files could be loaded successfully")
         return None
+    
     print("Concatenating relationship data...")
     df_all = pd.concat(dfs, ignore_index=True)
     print(f"Relationship table shape: {df_all.shape}")
@@ -238,9 +262,12 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
     # Normalize column names
     expected = {'concept_id_1', 'concept_id_2', 'relationship_id'}
     if not expected.issubset(set(df_all.columns)):
-        print(f"Warning: Relationship table missing expected columns. Expected: {expected}, Found: {set(df_all.columns)}")
+        print(f"❌ Warning: Relationship table missing expected columns. Expected: {expected}, Found: {set(df_all.columns)}")
         return None
-    return df_all[['concept_id_1', 'concept_id_2', 'relationship_id']]
+    
+    result = df_all[['concept_id_1', 'concept_id_2', 'relationship_id']]
+    print(f"Final relationship table shape: {result.shape}")
+    return result
 
 
 def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.DataFrame], rel_df: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -340,23 +367,154 @@ def build_top_table(
     if missing_interp.any():
         print("Adding fallback interpretations for non-concept tokens...")
         def fallback_interp(tok: str) -> str:
-            if tok.startswith('AGE_'):
-                return f"Age interval {tok[len('AGE_') : ]} years"
-            if tok.startswith('TIME_'):
-                return f"Time gap {tok[len('TIME_') : ]}"
-            if tok.startswith('EVENT_'):
-                return tok[len('EVENT_') : ].capitalize()
-            if tok.startswith('GENDER_'):
-                return f"Gender concept {tok[len('GENDER_') : ]}"
-            if tok.startswith('RACE_'):
-                return f"Race concept {tok[len('RACE_') : ]}"
-            if tok.startswith('YEAR_'):
-                return f"Birth year interval {tok[len('YEAR_') : ]}"
-            if tok.startswith('Q') and tok[1:].isdigit():
-                return f"Quantile token {tok}"
+            # Special tokens
             if tok in ('<PAD>', '<UNK>', '<EOS>', '<SOS>'):
                 return tok
-            return tok
+            
+            # Event types
+            if tok.startswith('EVENT_'):
+                event_type = tok[len('EVENT_'):].lower()
+                event_map = {
+                    'condition': 'Medical Condition',
+                    'drug': 'Medication',
+                    'procedure': 'Medical Procedure', 
+                    'measurement': 'Lab Test/Measurement',
+                    'observation': 'Clinical Observation',
+                    'visit': 'Healthcare Visit',
+                    'death': 'Death Event'
+                }
+                return event_map.get(event_type, f"Medical Event: {event_type.title()}")
+            
+            # Age intervals
+            if tok.startswith('AGE_'):
+                age_range = tok[len('AGE_'):]
+                if age_range == '0':
+                    return "Age: 0-1 years"
+                elif age_range == '1':
+                    return "Age: 1-5 years"
+                elif age_range == '5':
+                    return "Age: 5-10 years"
+                elif age_range == '10':
+                    return "Age: 10-15 years"
+                elif age_range == '15':
+                    return "Age: 15-20 years"
+                elif age_range == '20':
+                    return "Age: 20-30 years"
+                elif age_range == '30':
+                    return "Age: 30-40 years"
+                elif age_range == '40':
+                    return "Age: 40-50 years"
+                elif age_range == '50':
+                    return "Age: 50-60 years"
+                elif age_range == '60':
+                    return "Age: 60-70 years"
+                elif age_range == '70':
+                    return "Age: 70-80 years"
+                elif age_range == '80':
+                    return "Age: 80+ years"
+                else:
+                    return f"Age interval: {age_range} years"
+            
+            # Time intervals
+            if tok.startswith('TIME_'):
+                time_gap = tok[len('TIME_'):]
+                if time_gap == '0':
+                    return "Time: Same day"
+                elif time_gap == '1':
+                    return "Time: 1-6 months gap"
+                elif time_gap == '2':
+                    return "Time: 6-12 months gap"
+                elif time_gap == '3':
+                    return "Time: 1-2 years gap"
+                elif time_gap == '4':
+                    return "Time: 2-5 years gap"
+                elif time_gap == '5':
+                    return "Time: 5+ years gap"
+                else:
+                    return f"Time gap: {time_gap} intervals"
+            
+            # Gender
+            if tok.startswith('GENDER_'):
+                gender = tok[len('GENDER_'):]
+                gender_map = {'0': 'Unknown', '1': 'Male', '2': 'Female'}
+                return f"Gender: {gender_map.get(gender, gender)}"
+            
+            # Race/Ethnicity
+            if tok.startswith('RACE_'):
+                race = tok[len('RACE_'):]
+                race_map = {
+                    '0': 'Unknown', '1': 'White', '2': 'Black/African American',
+                    '3': 'Asian', '4': 'Hispanic/Latino', '5': 'Other'
+                }
+                return f"Race: {race_map.get(race, race)}"
+            
+            # Birth year intervals
+            if tok.startswith('YEAR_'):
+                year_range = tok[len('YEAR_'):]
+                if year_range == '0':
+                    return "Birth year: 2000+"
+                elif year_range == '1':
+                    return "Birth year: 1990-1999"
+                elif year_range == '2':
+                    return "Birth year: 1980-1989"
+                elif year_range == '3':
+                    return "Birth year: 1970-1979"
+                elif year_range == '4':
+                    return "Birth year: 1960-1969"
+                elif year_range == '5':
+                    return "Birth year: 1950-1959"
+                elif year_range == '6':
+                    return "Birth year: 1940-1949"
+                elif year_range == '7':
+                    return "Birth year: 1930-1939"
+                elif year_range == '8':
+                    return "Birth year: 1920-1929"
+                elif year_range == '9':
+                    return "Birth year: 1910-1919"
+                elif year_range == '10':
+                    return "Birth year: 1900-1909"
+                else:
+                    return f"Birth year interval: {year_range}"
+            
+            # Visit types
+            if tok.startswith('VISIT_TYPE_'):
+                visit_type = tok[len('VISIT_TYPE_'):]
+                visit_map = {
+                    '0': 'Unknown', '1': 'Inpatient', '2': 'Outpatient',
+                    '3': 'Emergency', '4': 'Urgent Care', '5': 'Primary Care'
+                }
+                return f"Visit type: {visit_map.get(visit_type, visit_type)}"
+            
+            # Units
+            if tok.startswith('UNIT_'):
+                unit_id = tok[len('UNIT_'):]
+                unit_map = {
+                    '0': 'Unknown unit', '1': 'mg/dL', '2': 'mmol/L', '3': 'mg/L',
+                    '4': 'ng/mL', '5': 'pg/mL', '6': 'U/L', '7': 'mEq/L',
+                    '8': 'mmHg', '9': 'bpm', '10': 'kg', '11': 'cm',
+                    '12': 'Fahrenheit', '13': 'Celsius', '14': 'inches',
+                    '15': 'pounds', '16': 'percent', '17': 'ratio'
+                }
+                return f"Unit: {unit_map.get(unit_id, f'Unit ID {unit_id}')}"
+            
+            # Quantiles
+            if tok.startswith('Q') and tok[1:].isdigit():
+                q_num = int(tok[1:])
+                if q_num == 0:
+                    return "Quantile: Minimum (0th percentile)"
+                elif q_num == 25:
+                    return "Quantile: 25th percentile"
+                elif q_num == 50:
+                    return "Quantile: Median (50th percentile)"
+                elif q_num == 75:
+                    return "Quantile: 75th percentile"
+                elif q_num == 100:
+                    return "Quantile: Maximum (100th percentile)"
+                else:
+                    return f"Quantile: {q_num}th percentile"
+            
+            # Default fallback
+            return f"Token: {tok}"
 
         df.loc[missing_interp, 'interpretation'] = df.loc[missing_interp, 'token'].apply(fallback_interp)
 
@@ -411,37 +569,35 @@ def main():
 
     # Load OMOP concept tables (best-effort)
     print("Loading OMOP concept tables...")
+    concept_df = None
+    rel_df = None
+    
     try:
         concept_df = read_concept_table(omop_dir)
-        if concept_df is None:
-            raise RuntimeError("Failed to load concept table - no data returned")
+        if concept_df is not None:
+            print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
+            print(f"   Available columns: {list(concept_df.columns)}")
+            if 'concept_name' in concept_df.columns:
+                print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
+        else:
+            print("⚠️  No concept table available - will use fallback interpretations")
     except Exception as e:
-        print(f"❌ Failed to load concept table")
-        print(f"Error: {e}")
-        import traceback
-        print("Full stack trace:")
-        traceback.print_exc()
-        raise RuntimeError("Concept table loading failed - cannot continue without OMOP data")
+        print(f"⚠️  Failed to load concept table: {e}")
+        print("Will continue with fallback interpretations")
     
     try:
         rel_df = read_concept_relationship_table(omop_dir)
-        if rel_df is None:
-            raise RuntimeError("Failed to load relationship table - no data returned")
+        if rel_df is not None:
+            print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
+            print(f"   Available columns: {list(rel_df.columns)}")
+        else:
+            print("⚠️  No relationship table available")
     except Exception as e:
-        print(f"❌ Failed to load relationship table")
-        print(f"Error: {e}")
-        import traceback
-        print("Full stack trace:")
-        traceback.print_exc()
-        raise RuntimeError("Relationship table loading failed - cannot continue without OMOP data")
+        print(f"⚠️  Failed to load relationship table: {e}")
+        print("Will continue without relationship data")
     
-    print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
-    print(f"   Available columns: {list(concept_df.columns)}")
-    if 'concept_name' in concept_df.columns:
-        print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
-    
-    print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
-    print(f"   Available columns: {list(rel_df.columns)}")
+    if concept_df is None and rel_df is None:
+        print("ℹ️  Running with fallback interpretations only - no OMOP concept data available")
 
     # Build table
     table = build_top_table(
