@@ -522,14 +522,16 @@ def build_top_table(
     print(f"Finalizing top {top_k} tokens...")
     # Final column selection - only include columns that exist
     available_cols = ['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation']
-    if 'concept_id' in df.columns:
-        available_cols.append('concept_id')
+    if 'concept_code' in df.columns:
+        available_cols.append('concept_code')
+    if 'concept_name' in df.columns:
+        available_cols.append('concept_name')
     if 'domain_id' in df.columns:
         available_cols.append('domain_id')
     if 'vocabulary_id' in df.columns:
         available_cols.append('vocabulary_id')
-    if 'concept_code' in df.columns:
-        available_cols.append('concept_code')
+    if 'concept_class_id' in df.columns:
+        available_cols.append('concept_class_id')
     
     df = df[available_cols]
     df = df.sort_values('raw_count', ascending=False).head(top_k).reset_index(drop=True)
