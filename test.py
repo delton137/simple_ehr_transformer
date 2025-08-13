@@ -565,9 +565,7 @@ def main() -> None:
     cur_ids = set(current_tt.keys())
     fut_ids = set(future_tt.keys())
     overlap = sorted(cur_ids & fut_ids)
-    if args.patient_limit is not None:
-        overlap = overlap[: args.patient_limit]
-    print(f"Evaluating on {len(overlap)} overlapping patients. Current={len(cur_ids)}, Future={len(fut_ids)}")
+    print(f"Overlapping patients: {len(overlap)} (Current={len(cur_ids)}, Future={len(fut_ids)})")
 
     # Model
     device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) else args.device)
@@ -627,9 +625,36 @@ def main() -> None:
     y_prob: Dict[str, List[float]] = {t: [] for t in targets}
     y_true: Dict[str, List[int]] = {t: [] for t in targets}
 
+    # Balanced sampling by future presence of primary target (first in list)
+    import random
+    primary = targets[0]
+    def has_primary_future(pid: int) -> bool:
+        seq = future_tt.get(pid, [])
+        names = {id_to_token.get(tid, "") for tid in seq}
+        return any(v in names for v in target_variants[primary])
+
+    if args.patient_limit is not None and len(overlap) > args.patient_limit:
+        pos_pids = [pid for pid in overlap if has_primary_future(pid)]
+        neg_pids = [pid for pid in overlap if not has_primary_future(pid)]
+        want = args.patient_limit
+        pos_n = min(want // 2, len(pos_pids))
+        neg_n = min(want - pos_n, len(neg_pids))
+        # If still short, top up from the larger pool
+        if pos_n + neg_n < want:
+            remain = want - (pos_n + neg_n)
+            if len(pos_pids) - pos_n >= len(neg_pids) - neg_n:
+                pos_n = min(len(pos_pids), pos_n + remain)
+            else:
+                neg_n = min(len(neg_pids), neg_n + remain)
+        selected = random.sample(pos_pids, pos_n) + random.sample(neg_pids, neg_n)
+        random.shuffle(selected)
+    else:
+        selected = overlap
+
     per_patient: Dict[int, Dict[str, float]] = {}
-    total = len(overlap)
-    for i, pid in enumerate(overlap, start=1):
+    total = len(selected)
+    print(f"Evaluating on {total} patients (balanced by future {primary} where possible)")
+    for i, pid in enumerate(selected, start=1):
         t0 = time.time()
         hist = current_tt.get(pid, [])
         fut = future_tt.get(pid, [])
