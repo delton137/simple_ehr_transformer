@@ -70,21 +70,10 @@ class ETHOSTrainer:
         from torch.optim.lr_scheduler import LambdaLR
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         
-        # Initialize AMP scaler
-        if self.use_amp:
-            try:
-                # Try modern PyTorch 2.0+ syntax first
-                self.scaler = torch.amp.GradScaler('cuda')
-                print("✅ Using modern AMP GradScaler")
-            except (AttributeError, TypeError):
-                try:
-                    # Fall back to PyTorch 1.6+ syntax
-                    self.scaler = torch.cuda.amp.GradScaler()
-                    print("✅ Using legacy AMP GradScaler")
-                except AttributeError:
-                    print("⚠️  AMP not available in this PyTorch version, disabling")
-                    self.use_amp = False
-                    self.scaler = None
+        # AMP scaler
+        self.scaler: Optional[torch.cuda.amp.GradScaler]
+        if self.use_amp and torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
         
@@ -150,7 +139,6 @@ class ETHOSTrainer:
             # Forward pass
             if (batch_idx % self.grad_accum_steps) == 0:
                 self.optimizer.zero_grad(set_to_none=True)
-            
             # Avoid gradient synchronization on non-accumulation steps when using DDP
             from contextlib import nullcontext
             sync_ctx = nullcontext()
@@ -159,26 +147,14 @@ class ETHOSTrainer:
 
             with sync_ctx:
                 if self.scaler is not None:
-                    try:
-                        # Try modern PyTorch 2.0+ syntax first
-                        with torch.amp.autocast('cuda'):
-                            logits = self.model(input_ids)
-                            batch_size, seq_len, vocab_size = logits.size()
-                            logits = logits.view(-1, vocab_size)
-                            targets = target_ids.view(-1)
-                            loss = self.criterion(logits, targets)
-                            loss = loss / self.grad_accum_steps
-                        self.scaler.scale(loss).backward()
-                    except (AttributeError, TypeError):
-                        # Fall back to PyTorch 1.6+ syntax
-                        with torch.cuda.amp.autocast():
-                            logits = self.model(input_ids)
-                            batch_size, seq_len, vocab_size = logits.size()
-                            logits = logits.view(-1, vocab_size)
-                            targets = target_ids.view(-1)
-                            loss = self.criterion(logits, targets)
-                            loss = loss / self.grad_accum_steps
-                        self.scaler.scale(loss).backward()
+                    with torch.amp.autocast('cuda'):
+                        logits = self.model(input_ids)
+                        batch_size, seq_len, vocab_size = logits.size()
+                        logits = logits.view(-1, vocab_size)
+                        targets = target_ids.view(-1)
+                        loss = self.criterion(logits, targets)
+                        loss = loss / self.grad_accum_steps
+                    self.scaler.scale(loss).backward()
                 else:
                     logits = self.model(input_ids)
                     # Reshape for loss calculation

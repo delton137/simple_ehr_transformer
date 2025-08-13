@@ -431,10 +431,11 @@ def build_top_table(
     df['prefix'] = parsed.apply(lambda x: x[0])
     df['concept_code'] = parsed.apply(lambda x: x[1])  # This is actually the concept_code, not concept_id
     
-    # Initialize concept_name column
+    # Initialize concept_name and interpretation columns
     df['concept_name'] = None
+    df['interpretation'] = None
     
-    # Map concept codes to concept names using OMOP concept table
+    # Map concept codes to concept names and metadata using OMOP concept table
     has_concepts = df['concept_code'].notna()
     if has_concepts.any() and concept_parquet_path:
         print(f"Using Polars-based concept lookup for top {len(df)} tokens...")
@@ -451,9 +452,41 @@ def build_top_table(
         # Set interpretation to concept_name when available
         df['interpretation'] = df['concept_name'].fillna(df['interpretation'])
         
+        # Try to enrich with additional concept metadata if available
+        try:
+            print("Enriching with additional concept metadata...")
+            import polars as pl
+            
+            # Read concept table to get additional metadata
+            concept_df = pl.read_parquet(concept_parquet_path, columns=["concept_id", "concept_name", "domain_id", "vocabulary_id", "concept_class_id"])
+            
+            # Convert to pandas for easier merging
+            concept_pandas = concept_df.to_pandas()
+            
+            # Merge with our DataFrame to get additional metadata
+            # Note: concept_code in our DataFrame corresponds to concept_id in OMOP
+            df_enriched = df.merge(
+                concept_pandas, 
+                how='left', 
+                left_on='concept_code', 
+                right_on='concept_id'
+            )
+            
+            # Add the new columns if they don't exist
+            if 'domain_id' in df_enriched.columns:
+                df['domain_id'] = df_enriched['domain_id']
+            if 'vocabulary_id' in df_enriched.columns:
+                df['vocabulary_id'] = df_enriched['vocabulary_id']
+            if 'concept_class_id' in df_enriched.columns:
+                df['concept_class_id'] = df_enriched['concept_class_id']
+            
+            print(f"Successfully enriched {df_enriched['domain_id'].notna().sum()} concepts with metadata")
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to enrich with concept metadata: {e}")
+            print("   Continuing with basic concept names only")
+        
         print(f"Successfully mapped concept names for {df['concept_name'].notna().sum()} concepts")
-    else:
-        df['interpretation'] = None
 
     # For tokens without OMOP concept, provide a readable interpretation
     missing_interp = df['interpretation'].isna()
