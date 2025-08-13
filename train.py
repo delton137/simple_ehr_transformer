@@ -63,7 +63,7 @@ class ETHOSTrainer:
         from torch.optim.lr_scheduler import LambdaLR
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         
-        if self.use_amp and torch.cuda.is_available():
+        if torch.cuda.is_available():
             self.scaler = torch.amp.GradScaler()
         else:
             self.scaler = None
@@ -448,7 +448,6 @@ def main():
 
     parser.add_argument('--max_seq_len', type=int, default=1024,
                        help='Max sequence length per sample (default: 1024)')
-    parser.add_argument('--use_amp', action='store_true', help='Enable mixed precision (AMP). If omitted and CUDA is available, AMP will be auto-enabled.')
     parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps (default: 4)')
     parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
     parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
@@ -507,7 +506,7 @@ def main():
             pass
     
     # Auto-enable AMP on CUDA if user didn't specify flag
-    if device.type == 'cuda' and not args.use_amp:
+    if device.type == 'cuda': 
         args.use_amp = True
     
     # Load data
@@ -624,31 +623,25 @@ def main():
         print(f"❌ Error creating model: {e}")
         return
     
-    # Setup training via ETHOSTrainer
-    print("\n⚙️  Setting up training...")
-    try:
-        trainer_config = {
-            'learning_rate': args.learning_rate,
-            'max_epochs': args.max_epochs,
-            'gradient_clip': model_config.gradient_clip,
-            'use_amp': args.use_amp,
-            'grad_accum_steps': args.grad_accum_steps,
-            'warmup_steps': args.warmup_steps,
-            'log_every': args.log_every,
-            'validate_every_steps': args.validate_every_steps,
-            'checkpoint_every_steps': args.checkpoint_every_steps,
-        }
-        # Determine model output directory (tag-aware)
-        model_dir = os.path.join('models', args.tag) if args.tag else 'models'
-        os.makedirs(model_dir, exist_ok=True)
-        print(f"💾 Models will be saved to: {model_dir}/")
-        trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config, model_dir=model_dir)
-        trainer.train()
-    except Exception as e:
-        print(f"❌ Training error: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+
+    trainer_config = {
+        'learning_rate': args.learning_rate,
+        'max_epochs': args.max_epochs,
+        'gradient_clip': model_config.gradient_clip,
+        'use_amp': args.use_amp,
+        'grad_accum_steps': args.grad_accum_steps,
+        'warmup_steps': args.warmup_steps,
+        'log_every': args.log_every,
+        'validate_every_steps': args.validate_every_steps,
+        'checkpoint_every_steps': args.checkpoint_every_steps,
+    }
+
+    model_dir = os.path.join('models', args.tag) if args.tag else 'models'
+    os.makedirs(model_dir, exist_ok=True)
+    print(f"💾 Models will be saved to: {model_dir}/")
+    trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config, model_dir=model_dir)
+    trainer.train()
+
 
 if __name__ == "__main__":
     main()

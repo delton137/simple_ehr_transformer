@@ -531,77 +531,131 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
-    tester = FutureTester(
-        model_path=args.model_path,
-        current_data_dir=args.current_data_dir,
-        future_data_dir=args.future_data_dir,
-        output_dir=args.output_dir,
-        device=args.device,
-        forward_horizon_days=args.forward_horizon_days,
-        num_samples=args.num_samples,
-        max_gen_tokens=args.max_gen_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        patient_limit=args.patient_limit,
-        vocab_path=args.vocab_path,
-    )
-    # Run simulation and compute AUROC for tokens_to_predict using future data
-    pids = list(tester.current_timelines.keys())
-    if tester.future_timelines is not None:
-        pids = [pid for pid in pids if pid in tester.future_timelines]
-        print(f"Evaluating on {len(pids)} patients present in both current and future datasets")
-    if tester.patient_limit is not None:
-        pids = pids[: tester.patient_limit]
+    import argparse
+    import pickle
+    from sklearn.metrics import roc_auc_score
 
-    # Storage for predictions and labels per target
-    y_prob: Dict[str, List[float]] = {t: [] for t in tester.token_variants.keys()}
-    y_true: Dict[str, List[int]] = {t: [] for t in tester.token_variants.keys()}
+    p = argparse.ArgumentParser(description="Evaluate next-year concept occurrence using tokenized timelines")
+    p.add_argument("--model_path", type=str, required=True)
+    p.add_argument("--current_data_dir", type=str, required=True, help="Processed data dir for current year (e.g., pre_2023)")
+    p.add_argument("--future_data_dir", type=str, required=True, help="Processed data dir for next year (e.g., 2023)")
+    p.add_argument("--output_dir", type=str, default="test_results")
+    p.add_argument("--device", type=str, default="auto", help="cpu, cuda, or auto")
+    p.add_argument("--num_samples", type=int, default=20)
+    p.add_argument("--max_input_len", type=int, default=512)
+    p.add_argument("--max_gen_tokens", type=int, default=256)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top_k", type=int, default=50)
+    p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--patient_limit", type=int, default=None)
+    args = p.parse_args()
 
-    per_patient_outputs: Dict[int, Dict] = {}
+    # Load current vocab and tokenized timelines
+    with open(os.path.join(args.current_data_dir, "vocabulary.pkl"), "rb") as f:
+        vocab: Dict[str, int] = pickle.load(f)
+    with open(os.path.join(args.current_data_dir, "tokenized_timelines.pkl"), "rb") as f:
+        current_tt: Dict[int, List[int]] = pickle.load(f)
 
-    for i, pid in enumerate(pids, start=1):
-        cur_events = tester.current_timelines[pid]
-        out = tester.simulate_patient(pid, cur_events)
-        per_patient_outputs[pid] = out
+    # Load future tokenized timelines
+    with open(os.path.join(args.future_data_dir, "tokenized_timelines.pkl"), "rb") as f:
+        future_tt: Dict[int, List[int]] = pickle.load(f)
 
-        # Ground-truth from future dataset within horizon
-        truth_map: Dict[str, int] = {}
-        if tester.future_timelines is not None and pid in tester.future_timelines:
-            truth_map = tester._truth_occurrence_for_targets(
-                current_events=cur_events,
-                future_events=tester.future_timelines[pid],
-            )
-        else:
-            truth_map = {k: 0 for k in tester.token_variants.keys()}
+    # Overlap of patient IDs
+    cur_ids = set(current_tt.keys())
+    fut_ids = set(future_tt.keys())
+    overlap = sorted(cur_ids & fut_ids)
+    if args.patient_limit is not None:
+        overlap = overlap[: args.patient_limit]
+    print(f"Evaluating on {len(overlap)} overlapping patients. Current={len(cur_ids)}, Future={len(fut_ids)}")
 
-        # Append per-target probabilities and labels
-        for tok in tester.token_variants.keys():
-            y_prob[tok].append(out["targeted_prob"].get(tok, 0.0))
-            y_true[tok].append(int(truth_map.get(tok, 0)))
+    # Model
+    device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) else args.device)
+    model = create_ethos_model(len(vocab))
+    checkpoint = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])  # type: ignore[index]
+    model = model.to(device)
+    model.eval()
 
-        if i % 25 == 0:
-            print(f"Processed {i}/{len(pids)} patients...")
+    id_to_token = {tid: name for name, tid in vocab.items()}
 
-    # Compute AUROC per token
-    metrics: Dict[str, float] = {}
-    for tok in tester.token_variants.keys():
+    # Targets: Type 2 diabetes (both new and legacy prefixes supported)
+    targets: List[str] = ["CONDITION_OCCURRENCE_201826", "CONDITION_201826"]
+    target_variants: Dict[str, set] = {}
+    for t in targets:
+        s = {t}
+        if t.startswith("CONDITION_OCCURRENCE_"):
+            s.add(t.replace("CONDITION_OCCURRENCE_", "CONDITION_", 1))
+        if t.startswith("CONDITION_"):
+            s.add(t.replace("CONDITION_", "CONDITION_OCCURRENCE_", 1))
+        target_variants[t] = s
+
+    def generate_probs(history_ids: List[int]) -> Dict[str, float]:
+        probs: Dict[str, float] = {t: 0.0 for t in targets}
+        if not history_ids:
+            return probs
+        input_ids = torch.tensor([history_ids[-args.max_input_len:]], dtype=torch.long, device=device)
+        count_present: Dict[str, int] = {t: 0 for t in targets}
+        for _ in range(args.num_samples):
+            with torch.no_grad():
+                out = model.generate(
+                    input_ids,
+                    max_length=history_ids[-args.max_input_len:].__len__() + args.max_gen_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    do_sample=True,
+                )
+            cont = out[0, input_ids.size(1):].tolist()
+            names = [id_to_token.get(tid, "") for tid in cont]
+            name_set = set(names)
+            for key, vars_set in target_variants.items():
+                if any(v in name_set for v in vars_set):
+                    count_present[key] += 1
+        for key in targets:
+            probs[key] = count_present[key] / float(args.num_samples)
+        return probs
+
+    # Prepare labels from future tokenized timelines (presence in the year)
+    def label_from_future(seq: List[int]) -> Dict[str, int]:
+        names = {id_to_token.get(tid, "") for tid in seq}
+        lab: Dict[str, int] = {}
+        for key, vars_set in target_variants.items():
+            lab[key] = 1 if any(v in names for v in vars_set) else 0
+        return lab
+
+    y_prob: Dict[str, List[float]] = {t: [] for t in targets}
+    y_true: Dict[str, List[int]] = {t: [] for t in targets}
+
+    per_patient: Dict[int, Dict[str, float]] = {}
+    for i, pid in enumerate(overlap, start=1):
+        hist = current_tt.get(pid, [])
+        fut = future_tt.get(pid, [])
+        probs = generate_probs(hist)
+        labs = label_from_future(fut)
+        per_patient[pid] = probs
+        for key in targets:
+            y_prob[key].append(probs.get(key, 0.0))
+            y_true[key].append(labs.get(key, 0))
+        if i % 50 == 0:
+            print(f"Processed {i}/{len(overlap)} patients")
+
+    # AUROC per target
+    aurocs: Dict[str, float] = {}
+    for key in targets:
         try:
-            metrics[tok] = roc_auc_score(y_true[tok], y_prob[tok])
+            aurocs[key] = roc_auc_score(y_true[key], y_prob[key])
         except Exception:
-            metrics[tok] = float("nan")
+            aurocs[key] = float("nan")
 
-    # Save outputs
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, "per_patient_predictions.json"), "w") as f:
-        json.dump(per_patient_outputs, f, indent=2)
+    with open(os.path.join(args.output_dir, "per_patient_probs.json"), "w") as f:
+        json.dump(per_patient, f, indent=2)
     with open(os.path.join(args.output_dir, "auroc_per_token.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(aurocs, f, indent=2)
 
     print("AUROC per token:")
-    for tok, auc in metrics.items():
-        print(f"  {tok}: {auc}")
+    for k, v in aurocs.items():
+        print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
