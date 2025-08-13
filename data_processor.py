@@ -8,8 +8,6 @@ Based on the ETHOS paper methodology
 import os
 import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
-import pyarrow.dataset as ds
 from typing import Dict, List, Tuple, Optional, Any, Iterator
 from datetime import datetime, timedelta
 import logging
@@ -18,18 +16,9 @@ import pickle
 from collections import defaultdict, Counter
 import gc
 import psutil
-import multiprocessing as mp
 from pathlib import Path
-import tempfile
-import shutil
 import argparse
-
-# Optional high-performance engine
-try:
-    import polars as pl
-except Exception:  # pragma: no cover
-    pl = None
-
+import polars as pl
 from config import data_config, token_config, model_config
 
 # Preferred datetime columns with date fallbacks per table

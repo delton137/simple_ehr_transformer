@@ -221,6 +221,7 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
 def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.DataFrame], rel_df: Optional[pd.DataFrame]) -> pd.DataFrame:
     print(f"Mapping {len(concept_ids)} concepts to standard concepts...")
     ci_df = pd.DataFrame({'concept_id': concept_ids}).drop_duplicates()
+    
     if rel_df is not None:
         print("Applying 'Maps to' relationships...")
         maps_to = rel_df[rel_df['relationship_id'] == 'Maps to'][['concept_id_1', 'concept_id_2']].drop_duplicates()
@@ -229,16 +230,28 @@ def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.Data
         ci_df = ci_df.drop(columns=['concept_id_1', 'concept_id_2'])
     else:
         ci_df['standard_id'] = ci_df['concept_id']
+    
     if concept_df is not None:
         print("Joining concept metadata...")
+        # First, get the original concept metadata
         concept_cols = ['concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
-        # Join on standard_id for final interpretation
-        ci_df = ci_df.merge(concept_df.rename(columns={'concept_id': 'standard_id'}), how='left', on='standard_id')
-        # For completeness, also provide original concept metadata if different
-        base_meta_cols = [c for c in concept_cols if c in concept_df.columns]
-        if base_meta_cols:
-            ci_df = ci_df.merge(concept_df[base_meta_cols].rename(columns={c: f'orig_{c}' for c in base_meta_cols}),
-                                how='left', left_on='concept_id', right_on=f'orig_concept_id')
+        available_concept_cols = [c for c in concept_cols if c in concept_df.columns]
+        
+        if available_concept_cols:
+            # Join original concept metadata
+            ci_df = ci_df.merge(concept_df[available_concept_cols], how='left', on='concept_id')
+            
+            # If we have standard concepts, also get their metadata
+            if 'standard_id' in ci_df.columns and 'standard_id' != 'concept_id':
+                standard_meta = concept_df[available_concept_cols].rename(columns={c: f'standard_{c}' for c in available_concept_cols})
+                ci_df = ci_df.merge(standard_meta, how='left', left_on='standard_id', right_on='standard_concept_id')
+                
+                # Prefer standard concept names if available
+                if 'standard_concept_name' in ci_df.columns:
+                    ci_df['concept_name'] = ci_df['standard_concept_name'].fillna(ci_df['concept_name'])
+    else:
+        print("No concept table available for metadata")
+    
     return ci_df
 
 
@@ -377,11 +390,18 @@ def main():
     rel_df = read_concept_relationship_table(omop_dir)
     
     if concept_df is not None:
-        print(f"Loaded concept table with {len(concept_df)} concepts")
+        print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
+        print(f"   Available columns: {list(concept_df.columns)}")
+        if 'concept_name' in concept_df.columns:
+            print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
+    else:
+        print("❌ Failed to load concept table")
+    
     if rel_df is not None:
-        print(f"Loaded relationship table with {len(rel_df)} relationships")
-    if concept_df is None and rel_df is None:
-        print("No OMOP concept tables found - will use fallback interpretations")
+        print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
+        print(f"   Available columns: {list(rel_df.columns)}")
+    else:
+        print("❌ Failed to load relationship table")
 
     # Build table
     table = build_top_table(

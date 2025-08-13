@@ -5,26 +5,24 @@ Based on the ETHOS paper methodology for training transformer models on Patient 
 """
 
 import os
+import logging
+import argparse
+import time
+import math
+import csv
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import logging
-import argparse
-from tqdm import tqdm
-import time
-import matplotlib.pyplot as plt
-from typing import Optional
-import math
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-import csv
-
 from config import model_config
-from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
+from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataLoader
 from model import create_ethos_model, ETHOSTransformer
 
-# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -346,36 +344,10 @@ class ETHOSTrainer:
         
         logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
     
-    def plot_training_curves(self):
-        """Plot training and validation curves"""
-        if self.rank != 0:
-            return
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # Loss curves
-        ax1.plot(self.train_losses, label='Training Loss', color='blue')
-        ax1.plot(self.val_losses, label='Validation Loss', color='red')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # Learning rate curve
-        ax2.plot(self.learning_rates, label='Learning Rate', color='green')
-        ax2.set_xlabel('Step')
-        ax2.set_ylabel('Learning Rate')
-        ax2.set_title('Learning Rate Schedule')
-        ax2.legend()
-        ax2.grid(True)
-        ax2.set_yscale('log')
-        
-        plt.tight_layout()
-        plt.savefig('plots/training_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    
+   
     def train(self, resume_from: str = None):
         """Main training loop"""
+
         if self.rank == 0:
             logger.info("Starting training...")
         
@@ -435,13 +407,8 @@ class ETHOSTrainer:
             # Save checkpoint
             self.save_checkpoint(is_best=is_best)
             
-            # Plot curves every 10 epochs (rank 0)
-            if self.rank == 0 and ((epoch + 1) % 10 == 0):
-                self.plot_training_curves()
-        
         # Final plotting
         if self.rank == 0:
-            self.plot_training_curves()
             logger.info("Training completed!")
 
 

@@ -17,19 +17,16 @@ and a summary metrics JSON if ground truth is available.
 import os
 import json
 import argparse
+import torch
+import numpy as np
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
-
-import numpy as np
-import torch
-
 from model import create_ethos_model
 
 
 # -----------------------------
 # Time utilities
 # -----------------------------
-
 TIME_LABEL_TO_MINUTES = {
     "5m": 5,
     "15m": 15,
