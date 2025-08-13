@@ -109,13 +109,47 @@ class OMOPDataProcessor:
         if ts_source and ts_source not in names:
             ts_source = None
         select_cols = [c for c in ["person_id", ts_source or ts_col, cid_col, val_col, unit_col] if c and c in names]
+        # Extra concept fields to include if present
+        extra_cols = []
+        if table == "condition_occurrence":
+            for c in ("condition_status_concept_id",):
+                if c in names:
+                    select_cols.append(c); extra_cols.append(c)
+        elif table == "drug_exposure":
+            for c in ("route_concept_id",):
+                if c in names:
+                    select_cols.append(c); extra_cols.append(c)
+        elif table == "measurement":
+            for c in ("value_as_concept_id",):
+                if c in names:
+                    select_cols.append(c); extra_cols.append(c)
+        elif table == "observation":
+            for c in ("observation_type_concept_id","value_as_concept_id"):
+                if c in names:
+                    select_cols.append(c); extra_cols.append(c)
+        elif table == "procedure_occurrence":
+            for c in ("procedure_type_concept_id",):
+                if c in names:
+                    select_cols.append(c); extra_cols.append(c)
         # Pull source concept as fallback if available for supported tables
         src_col = SOURCE_CONCEPT_FALLBACK.get(table)
         if src_col and src_col in names:
             select_cols.append(src_col)
+        rename_map = {(ts_source or ts_col): "ts", cid_col: "cid"}
+        # Aliases for extra fields in unified schema
+        alias_map = {
+            "condition_status_concept_id": "cond_status",
+            "route_concept_id": "drug_route",
+            "value_as_concept_id": "value_as_concept_id",  # keep name
+            "observation_type_concept_id": "obs_type",
+            "procedure_type_concept_id": "proc_type",
+        }
+        for c in extra_cols:
+            if c in alias_map:
+                rename_map[c] = alias_map[c]
         lf = (base_scan
               .select(select_cols)
-              .rename({(ts_source or ts_col): "ts", cid_col: "cid"}))
+              .rename(rename_map))
         # Fallback: if standard concept is 0/NULL, use source concept when present
         if src_col and src_col in names:
             lf = lf.with_columns(
@@ -134,6 +168,10 @@ class OMOPDataProcessor:
             to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
         elif 'unit_concept_id' not in names:
             to_add.append(pl.lit(None).cast(pl.Int64).alias('unit_concept_id'))
+        # Ensure extra alias columns exist across all tables
+        for alias in ("cond_status","drug_route","value_as_concept_id","obs_type","proc_type"):
+            if alias not in lf.collect_schema().names():
+                to_add.append(pl.lit(None).cast(pl.Int64).alias(alias))
         if to_add:
             lf = lf.with_columns(to_add)
         # Add event type literal
@@ -147,9 +185,15 @@ class OMOPDataProcessor:
             pl.col('value_as_number').cast(pl.Float64),
             pl.col('unit_concept_id').cast(pl.Int64),
             pl.col('et').cast(pl.Utf8),
+            pl.col('cond_status').cast(pl.Int64),
+            pl.col('drug_route').cast(pl.Int64),
+            pl.col('value_as_concept_id').cast(pl.Int64),
+            pl.col('obs_type').cast(pl.Int64),
+            pl.col('proc_type').cast(pl.Int64),
         ])
         # Order columns identically across tables
-        lf = lf.select(['person_id', 'ts', 'et', 'cid', 'value_as_number', 'unit_concept_id'])
+        lf = lf.select(['person_id', 'ts', 'et', 'cid', 'value_as_number', 'unit_concept_id',
+                        'cond_status','drug_route','value_as_concept_id','obs_type','proc_type'])
         return lf
     
     def _build_events_polars(self) -> 'pl.LazyFrame':
@@ -166,7 +210,9 @@ class OMOPDataProcessor:
                       pl.col("ts").cast(pl.Datetime("ns")),
                       (pl.col("person_id") % 1024).cast(pl.Int64).alias("pid_bucket")
                   ])
-                  .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id", "pid_bucket"]))
+                  .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id",
+                           'cond_status','drug_route','value_as_concept_id','obs_type','proc_type',
+                           "pid_bucket"]))
         return events
     
     def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
