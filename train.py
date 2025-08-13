@@ -68,8 +68,6 @@ class ETHOSTrainer:
         from torch.optim.lr_scheduler import LambdaLR
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         
-        # AMP scaler
-        self.scaler: Optional[torch.cuda.amp.GradScaler]
         if self.use_amp and torch.cuda.is_available():
             self.scaler = torch.amp.GradScaler()
         else:
@@ -388,7 +386,7 @@ class ETHOSTrainer:
             return True
             
 
-    
+!-------------------------------------------------------------------------------------------
     def train(self, resume_from: str = None):
         """Main training loop with automatic checkpoint detection"""
 
