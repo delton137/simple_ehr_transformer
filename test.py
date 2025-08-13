@@ -148,6 +148,22 @@ class FutureTester:
             self.current_timelines = {int(k): v for k, v in self.current_timelines.items()}
         except Exception:
             pass
+        if len(self.current_timelines) == 0:
+            # Diagnostics: check for tokenized timelines to infer available patient ids
+            tt_path = os.path.join(current_data_dir, "tokenized_timelines.pkl")
+            if os.path.exists(tt_path):
+                try:
+                    with open(tt_path, "rb") as f:
+                        import pickle
+                        _tt = pickle.load(f)
+                    _ids = list(_tt.keys())
+                    try:
+                        _ids = [int(k) for k in _ids]
+                    except Exception:
+                        pass
+                    print(f"Info: current_data_dir tokenized_timelines.pkl has {len(_ids)} patient IDs (patient_timelines.pkl is empty)")
+                except Exception:
+                    pass
 
         # Optional: future ground-truth timelines
         self.future_timelines: Optional[Dict[int, List[Dict]]] = None
@@ -162,6 +178,21 @@ class FutureTester:
                     self.future_timelines = {int(k): v for k, v in self.future_timelines.items()}  # type: ignore[dict-item]
                 except Exception:
                     pass
+                if len(self.future_timelines) == 0:
+                    tt_path2 = os.path.join(future_data_dir, "tokenized_timelines.pkl")
+                    if os.path.exists(tt_path2):
+                        try:
+                            with open(tt_path2, "rb") as f:
+                                import pickle
+                                _tt2 = pickle.load(f)
+                            _ids2 = list(_tt2.keys())
+                            try:
+                                _ids2 = [int(k) for k in _ids2]
+                            except Exception:
+                                pass
+                            print(f"Info: future_data_dir tokenized_timelines.pkl has {len(_ids2)} patient IDs (patient_timelines.pkl is empty)")
+                        except Exception:
+                            pass
         
         # Quick diagnostics if a future dataset exists
         if self.future_timelines is not None:
