@@ -247,8 +247,9 @@ class FutureTester:
         # Hard-coded tokens to predict (Type 2 diabetes). Include legacy and table-inclusive.
         # User provided: CONDITION_201826 (correct); earlier typo 20182 ignored.
         self.tokens_to_predict: List[str] = [
-            "CONDITION_OCCURRENCE_201826",
-            "CONDITION_201826",
+            "CONDITION_201826", #diabetes t2d
+            "CONDITION_444070",	#fatigue
+            "CONDITION_316139", #heart failure
         ]
         # Map to actual vocab names present; allow flexible matching
         self.token_variants: Dict[str, Set[str]] = self._resolve_token_variants(self.tokens_to_predict)
