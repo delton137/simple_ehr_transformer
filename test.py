@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import torch
 
-from transformer_model import create_ethos_model
+from model import create_ethos_model
 
 
 # -----------------------------

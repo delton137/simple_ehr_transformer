@@ -284,7 +284,7 @@ The trained model can perform zero-shot predictions:
 
 ```python
 from data_processor import OMOPDataProcessor
-from transformer_model import create_ethos_model
+from model import create_ethos_model
 from inference import ETHOSInference
 
 # 1. Process data with custom path

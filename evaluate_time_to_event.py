@@ -26,7 +26,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_
 import matplotlib.pyplot as plt
 
 from config import data_config
-from transformer_model import create_ethos_model
+from model import create_ethos_model
 from data_processor import OMOPDataProcessor
 
 

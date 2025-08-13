@@ -75,9 +75,11 @@ def parse_token(token_str: str) -> Tuple[Optional[str], Optional[int]]:
 def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
     concept_dir = os.path.join(omop_dir, 'concept')
     if not os.path.isdir(concept_dir):
+        print(f"Concept directory not found: {concept_dir}")
         return None
     files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
     if not files:
+        print(f"No parquet files found in concept directory: {concept_dir}")
         return None
     print(f"Loading concept table from {len(files)} parquet files...")
     dfs: List[pd.DataFrame] = []
@@ -85,31 +87,46 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
             dfs.append(df)
-        except Exception:
+        except Exception as e:
+            print(f"Failed to load {fp} with pyarrow: {e}")
             try:
                 df = pd.read_parquet(fp, engine='fastparquet')
                 dfs.append(df)
-            except Exception:
+            except Exception as e2:
+                print(f"Failed to load {fp} with fastparquet: {e2}")
                 continue
     if not dfs:
+        print("No concept files could be loaded successfully")
         return None
     print("Concatenating concept data...")
     df_all = pd.concat(dfs, ignore_index=True)
+    print(f"Concept table shape: {df_all.shape}")
+    print(f"Concept table columns: {list(df_all.columns)}")
+    
     # Keep relevant columns if present
     keep_cols = [
         'concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code',
         'standard_concept'
     ]
     cols = [c for c in keep_cols if c in df_all.columns]
-    return df_all[cols].drop_duplicates('concept_id') if cols else df_all.drop_duplicates('concept_id')
+    print(f"Available columns: {cols}")
+    if not cols:
+        print("Warning: No expected columns found in concept table")
+        return None
+    
+    result = df_all[cols].drop_duplicates('concept_id') if 'concept_id' in cols else df_all.drop_duplicates()
+    print(f"Final concept table shape: {result.shape}")
+    return result
 
 
 def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
     rel_dir = os.path.join(omop_dir, 'concept_relationship')
     if not os.path.isdir(rel_dir):
+        print(f"Concept relationship directory not found: {rel_dir}")
         return None
     files = [os.path.join(rel_dir, f) for f in os.listdir(rel_dir) if f.endswith('.parquet')]
     if not files:
+        print(f"No parquet files found in concept relationship directory: {rel_dir}")
         return None
     print(f"Loading concept relationship table from {len(files)} parquet files...")
     dfs: List[pd.DataFrame] = []
@@ -117,19 +134,26 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
             dfs.append(df)
-        except Exception:
+        except Exception as e:
+            print(f"Failed to load {fp} with pyarrow: {e}")
             try:
                 df = pd.read_parquet(fp, engine='fastparquet')
                 dfs.append(df)
-            except Exception:
+            except Exception as e2:
+                print(f"Failed to load {fp} with fastparquet: {e2}")
                 continue
     if not dfs:
+        print("No relationship files could be loaded successfully")
         return None
     print("Concatenating relationship data...")
     df_all = pd.concat(dfs, ignore_index=True)
+    print(f"Relationship table shape: {df_all.shape}")
+    print(f"Relationship table columns: {list(df_all.columns)}")
+    
     # Normalize column names
     expected = {'concept_id_1', 'concept_id_2', 'relationship_id'}
     if not expected.issubset(set(df_all.columns)):
+        print(f"Warning: Relationship table missing expected columns. Expected: {expected}, Found: {set(df_all.columns)}")
         return None
     return df_all[['concept_id_1', 'concept_id_2', 'relationship_id']]
 
@@ -193,14 +217,23 @@ def build_top_table(
 
     # Map concept ids to standard concepts and names
     has_concepts = df['concept_id'].notna()
-    if has_concepts.any():
+    if has_concepts.any() and concept_df is not None:
         concept_ids = df.loc[has_concepts, 'concept_id'].astype(int).tolist()
         mapped = map_to_standard_concept(concept_ids, concept_df, rel_df)
-        # Merge back on concept_id
-        df = df.merge(mapped[['concept_id', 'standard_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']],
-                      how='left', on='concept_id')
-        # Interpretation preference: concept_name if present
-        df['interpretation'] = df['concept_name']
+        # Check if mapped has the expected columns before merging
+        expected_cols = ['concept_id', 'standard_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
+        available_cols = [col for col in expected_cols if col in mapped.columns]
+        if len(available_cols) >= 2:  # Need at least concept_id and one other column
+            # Merge back on concept_id
+            df = df.merge(mapped[available_cols], how='left', on='concept_id')
+            # Interpretation preference: concept_name if present
+            if 'concept_name' in available_cols:
+                df['interpretation'] = df['concept_name']
+            else:
+                df['interpretation'] = None
+        else:
+            print(f"Warning: Mapped concept table missing expected columns. Available: {list(mapped.columns)}")
+            df['interpretation'] = None
     else:
         df['interpretation'] = None
 

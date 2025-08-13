@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from config import model_config, data_config
-from transformer_model import create_ethos_model
+from model import create_ethos_model
 from data_processor import EHRDataProcessor
 
 # Set up logging

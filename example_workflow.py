@@ -100,7 +100,7 @@ def main():
     logger.info("\n3. Creating ETHOS Model...")
     
     try:
-        from transformer_model import create_ethos_model
+        from model import create_ethos_model
         
         # Create model
         model = create_ethos_model(len(vocab))

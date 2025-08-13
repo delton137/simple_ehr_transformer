@@ -23,7 +23,7 @@ import csv
 
 from config import model_config, data_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
-from ethos_model import create_small_ethos_model, SmallETHOSTransformer
+from model import create_small_ethos_model, SmallETHOSTransformer
 
 # Set up logging
 logging.basicConfig(
