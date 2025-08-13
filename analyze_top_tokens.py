@@ -774,6 +774,11 @@ def main():
     else:
         print("ℹ️  No relationship table found - will continue without it")
     
+    # Add a fallback option to skip relationship table if it's causing issues
+    if rel_df is None and omop_dir and os.path.exists(os.path.join(omop_dir, 'concept_relationship')):
+        print("⚠️  Relationship table loading failed - continuing without it")
+        print("   This won't affect the main token analysis, only the concept relationship mapping")
+    
     if concept_parquet_path is None and rel_df is None:
         print("ℹ️  Running with fallback interpretations only - no OMOP concept data available")
 

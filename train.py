@@ -10,8 +10,6 @@ import argparse
 import time
 import math
 import csv
-from tqdm import tqdm
-import matplotlib.pyplot as plt
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -103,10 +101,17 @@ class ETHOSTrainer:
         if self.rank != 0:
             return
         
-        # Create CSV file with headers
-        with open(self.csv_log_path, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['iteration', 'epoch', 'train_loss', 'val_loss', 'learning_rate', 'timestamp'])
+        # Check if CSV file already exists (for resuming)
+        csv_exists = os.path.exists(self.csv_log_path)
+        
+        if csv_exists:
+            logger.info(f"CSV file exists, will append to: {self.csv_log_path}")
+        else:
+            # Create CSV file with headers
+            with open(self.csv_log_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['iteration', 'epoch', 'train_loss', 'val_loss', 'learning_rate', 'timestamp'])
+            logger.info(f"Created new CSV file: {self.csv_log_path}")
         
         logger.info(f"CSV logging enabled: {self.csv_log_path}")
     
@@ -344,17 +349,141 @@ class ETHOSTrainer:
         
         logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
     
-   
+    def find_latest_checkpoint(self) -> Optional[str]:
+        """Automatically find the latest checkpoint file"""
+        if not os.path.exists(self.model_dir):
+            return None
+        
+        # Priority order: best_checkpoint.pth > latest_checkpoint.pth > step checkpoints
+        checkpoint_paths = [
+            os.path.join(self.model_dir, 'best_checkpoint.pth'),
+            os.path.join(self.model_dir, 'latest_checkpoint.pth')
+        ]
+        
+        # Add step checkpoints if they exist
+        step_checkpoints = []
+        for filename in os.listdir(self.model_dir):
+            if filename.startswith('checkpoint_step_') and filename.endswith('.pth'):
+                try:
+                    step = int(filename.replace('checkpoint_step_', '').replace('.pth', ''))
+                    step_checkpoints.append((step, os.path.join(self.model_dir, filename)))
+                except ValueError:
+                    continue
+        
+        # Sort step checkpoints by step number (descending)
+        step_checkpoints.sort(key=lambda x: x[0], reverse=True)
+        checkpoint_paths.extend([path for _, path in step_checkpoints])
+        
+        # Return the first existing checkpoint
+        for path in checkpoint_paths:
+            if os.path.exists(path):
+                return path
+        
+        return None
+    
+    def auto_resume_from_checkpoint(self) -> bool:
+        """Automatically resume from the latest available checkpoint if it exists"""
+        if self.rank != 0:
+            return False
+        
+        latest_checkpoint = self.find_latest_checkpoint()
+        if latest_checkpoint is None:
+            logger.info("No checkpoint found - starting training from scratch")
+            return False
+        
+        try:
+            logger.info(f"Found checkpoint: {latest_checkpoint}")
+            self.load_checkpoint(latest_checkpoint)
+            
+            # Check if we have a CSV file to determine the last logged iteration
+            if os.path.exists(self.csv_log_path):
+                try:
+                    # Read the last line to get the last logged iteration
+                    with open(self.csv_log_path, 'r') as csvfile:
+                        lines = csvfile.readlines()
+                        if len(lines) > 1:  # Has header + at least one data row
+                            last_line = lines[-1].strip()
+                            if last_line:
+                                last_iteration = int(last_line.split(',')[0])
+                                logger.info(f"Last logged iteration from CSV: {last_iteration}")
+                                # Update global_step if CSV shows a later iteration
+                                if last_iteration > self.global_step:
+                                    logger.info(f"Updating global_step from {self.global_step} to {last_iteration}")
+                                    self.global_step = last_iteration
+                except Exception as e:
+                    logger.warning(f"Could not read last iteration from CSV: {e}")
+            
+            logger.info(f"✓ Auto-resumed training from epoch {self.current_epoch + 1}, step {self.global_step}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to auto-resume from checkpoint {latest_checkpoint}: {e}")
+            logger.info("Starting training from scratch")
+            # Reset training state
+            self.current_epoch = 0
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.train_losses = []
+            self.val_losses = []
+            self.learning_rates = []
+            return False
+    
+    def list_available_checkpoints(self) -> list:
+        """List all available checkpoints with metadata"""
+        if not os.path.exists(self.model_dir):
+            return []
+        
+        checkpoints = []
+        for filename in os.listdir(self.model_dir):
+            if filename.endswith('.pth'):
+                filepath = os.path.join(self.model_dir, filename)
+                try:
+                    # Try to load checkpoint metadata
+                    checkpoint = torch.load(filepath, map_location='cpu')
+                    metadata = checkpoint.get('metadata', {})
+                    
+                    checkpoints.append({
+                        'filename': filename,
+                        'path': filepath,
+                        'epoch': checkpoint.get('epoch', 'N/A'),
+                        'global_step': checkpoint.get('global_step', 'N/A'),
+                        'best_val_loss': checkpoint.get('best_val_loss', 'N/A'),
+                        'timestamp': metadata.get('timestamp', 'N/A'),
+                        'size_mb': os.path.getsize(filepath) / (1024 * 1024)
+                    })
+                except Exception:
+                    # If we can't read the checkpoint, just add basic info
+                    checkpoints.append({
+                        'filename': filename,
+                        'path': filepath,
+                        'epoch': 'N/A',
+                        'global_step': 'N/A',
+                        'best_val_loss': 'N/A',
+                        'timestamp': 'N/A',
+                        'size_mb': os.path.getsize(filepath) / (1024 * 1024)
+                    })
+        
+        # Sort by filename for consistent ordering
+        checkpoints.sort(key=lambda x: x['filename'])
+        return checkpoints
+    
     def train(self, resume_from: str = None):
-        """Main training loop"""
+        """Main training loop with automatic checkpoint detection"""
 
         if self.rank == 0:
             logger.info("Starting training...")
         
-        # Resume from checkpoint if specified
-        if resume_from and os.path.exists(resume_from) and self.rank == 0:
-            self.load_checkpoint(resume_from)
-            logger.info(f"Resumed training from epoch {self.current_epoch + 1}")
+        # Auto-resume from latest checkpoint if available
+        if self.rank == 0:
+            # List available checkpoints for debugging
+            available_checkpoints = self.list_available_checkpoints()
+            if available_checkpoints:
+                logger.info(f"Found {len(available_checkpoints)} checkpoint(s) in {self.model_dir}:")
+                for cp in available_checkpoints:
+                    logger.info(f"  - {cp['filename']}: epoch {cp['epoch']}, step {cp['global_step']}, loss {cp['best_val_loss']}")
+            
+            # Attempt auto-resume
+            self.auto_resume_from_checkpoint()
         
         # Training loop
         for epoch in range(self.current_epoch, self.config['max_epochs']):
@@ -437,8 +566,7 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                        choices=['auto', 'cuda', 'cpu'],
                        help='Device to use (default: auto)')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Resume training from checkpoint')
+
     parser.add_argument('--max_seq_len', type=int, default=1024,
                        help='Max sequence length per sample (default: 1024)')
     parser.add_argument('--use_amp', action='store_true', help='Enable mixed precision (AMP). If omitted and CUDA is available, AMP will be auto-enabled.')
@@ -705,7 +833,7 @@ def main():
         if is_rank0:
             print(f"💾 Models will be saved to: {model_dir}/")
         trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config, model_dir=model_dir, train_sampler=train_sampler, rank=rank)
-        trainer.train(resume_from=args.resume)
+        trainer.train()
     except Exception as e:
         if is_rank0:
             print(f"❌ Training error: {e}")
