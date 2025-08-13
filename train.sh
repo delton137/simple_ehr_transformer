@@ -1,4 +1,5 @@
-DATA_DIR=/home/jupyter/workspaces/ehrtransformerbaseline/simple_ehr_transformer/processed_data_aou_10days
+TAG=aou_pre2023_30000
+DATA_DIR=/home/jupyter/workspaces/ehrtransformerbaseline/simple_ehr_transformer/processed_data_$TAG
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_DEBUG=INFO
@@ -8,7 +9,7 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=1
 
-python train.py --tag aou_10days --data_dir $DATA_DIR --batch_size 8 --max_seq_len 512 --use_amp --num_workers 0
+python train.py --tag $TAG --data_dir $DATA_DIR --batch_size 8 --max_seq_len 512 --use_amp --num_workers 0
 
 #torchrun --standalone --nproc_per_node=4 train.py \
 #  --tag aou_10days \
