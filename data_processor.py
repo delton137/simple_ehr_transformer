@@ -32,6 +32,29 @@ except Exception:  # pragma: no cover
 
 from config import data_config, token_config, model_config
 
+# Preferred datetime columns with date fallbacks per table
+DATE_FALLBACKS = {
+    "measurement": "measurement_date",
+    "condition_occurrence": "condition_start_date",
+    "drug_exposure": "drug_exposure_start_date",
+    "observation": "observation_date",
+    "visit_occurrence": "visit_start_date",
+    "visit_detail": "visit_detail_start_date",
+    "procedure_occurrence": "procedure_date",
+    "device_exposure": "device_exposure_start_date",
+    "note": "note_date",
+    "death": "death_date",
+}
+
+# Fallback to source concept ids when standard concept ids are 0/NULL
+SOURCE_CONCEPT_FALLBACK = {
+    "condition_occurrence": "condition_source_concept_id",
+    "drug_exposure": "drug_source_concept_id",
+    "measurement": "measurement_source_concept_id",
+    "observation": "observation_source_concept_id",
+    "procedure_occurrence": "procedure_source_concept_id",
+}
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -81,9 +104,25 @@ class OMOPDataProcessor:
             cols.append(unit_col)
         base_scan = pl.scan_parquet(path)
         names = base_scan.collect_schema().names()
+        # Determine timestamp source column; fallback to date if needed
+        ts_source = ts_col if ts_col in names else DATE_FALLBACKS.get(table)
+        if ts_source and ts_source not in names:
+            ts_source = None
+        select_cols = [c for c in ["person_id", ts_source or ts_col, cid_col, val_col, unit_col] if c and c in names]
+        # Pull source concept as fallback if available for supported tables
+        src_col = SOURCE_CONCEPT_FALLBACK.get(table)
+        if src_col and src_col in names:
+            select_cols.append(src_col)
         lf = (base_scan
-              .select([c for c in cols if c in names])
-              .rename({ts_col: "ts", cid_col: "cid"}))
+              .select(select_cols)
+              .rename({(ts_source or ts_col): "ts", cid_col: "cid"}))
+        # Fallback: if standard concept is 0/NULL, use source concept when present
+        if src_col and src_col in names:
+            lf = lf.with_columns(
+                pl.when((pl.col("cid").is_null()) | (pl.col("cid") == 0))
+                  .then(pl.col(src_col))
+                  .otherwise(pl.col("cid")).alias("cid")
+            )
         # Ensure expected columns exist with unified names
         to_add = []
         # For non-measurement tables, always add null placeholders
@@ -122,7 +161,7 @@ class OMOPDataProcessor:
         obs  = self._scan_table_pl("observation", "observation_datetime", "observation", "observation_concept_id")
         events = pl.concat([cond, drug, proc, meas, obs], how="vertical_relaxed")
         events = (events
-                  .filter(pl.col("ts").is_not_null() & pl.col("cid").is_not_null())
+                  .filter(pl.col("ts").is_not_null() & pl.col("cid").is_not_null() & (pl.col("cid") > 0))
                   .with_columns([
                       pl.col("ts").cast(pl.Datetime("ns")),
                       (pl.col("person_id") % 1024).cast(pl.Int64).alias("pid_bucket")
@@ -353,6 +392,18 @@ class OMOPDataProcessor:
             self.vocab[f"RACE_{r}"] = len(self.vocab)
         for yi in sorted(year_intervals):
             self.vocab[f"YEAR_{yi}"] = len(self.vocab)
+        # Unit tokens present in events
+        try:
+            units_df = (events
+                        .select(pl.col("unit_concept_id"))
+                        .drop_nulls()
+                        .unique()
+                        .collect())
+            if units_df.height:
+                for u in units_df.get_column("unit_concept_id").to_list():
+                    self.vocab[f"UNIT_{int(u)}"] = len(self.vocab)
+        except Exception:
+            pass
         # Add concept tokens up to capacity
         max_concepts = model_config.vocab_size - len(self.vocab)
         for concept, _n in concept_counts.most_common(max_concepts):
