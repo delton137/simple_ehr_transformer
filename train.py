@@ -22,7 +22,7 @@ import csv
 
 from config import model_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
-from model import create_ethos_model, SmallETHOSTransformer
+from model import create_ethos_model, ETHOSTransformer
 
 # Set up logging
 logging.basicConfig(
@@ -671,7 +671,7 @@ def main():
             if is_rank0:
                 print("⚠️ OOM during model creation. Retrying with smaller configuration (d_model=384, n_heads=6, d_ff=1536)...")
             try:
-                model = SmallETHOSTransformer(
+                model = ETHOSTransformer(
                     vocab_size=len(vocab),
                     d_model=384,
                     n_heads=6,
