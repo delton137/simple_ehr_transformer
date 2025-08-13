@@ -425,8 +425,8 @@ def build_top_table(
     total = df['raw_count'].sum()
     df['frequency_percent'] = (df['raw_count'] / max(1, total)) * 100.0
 
-    # Extract OMOP concept ids when applicable
-    print("Extracting concept IDs from tokens...")
+    # Extract OMOP concept codes when applicable
+    print("Extracting concept codes from tokens...")
     parsed = df['token'].apply(parse_token)
     df['prefix'] = parsed.apply(lambda x: x[0])
     df['concept_code'] = parsed.apply(lambda x: x[1])  # This is actually the concept_code, not concept_id
@@ -434,22 +434,46 @@ def build_top_table(
     # Map concept codes to concept names using OMOP concept table
     has_concepts = df['concept_code'].notna()
     if has_concepts.any() and concept_parquet_path:
-        print(f"Using Polars-based concept lookup for {len(concept_parquet_path)} concept files...")
+        print(f"Using Polars-based concept lookup for concept codes...")
         concept_codes = df.loc[has_concepts, 'concept_code'].astype(int).tolist()
         print(f"Found {len(concept_codes)} concept codes to map")
         
-        # Map concept_code to concept_name using the OMOP concept table
-        # We need to join on concept_code, not concept_id
-        concept_mapping = pl.read_parquet(concept_parquet_path, columns=["concept_code", "concept_name", "domain_id", "vocabulary_id", "concept_class_id"]).to_pandas()
-        concept_mapping['concept_code'] = concept_mapping['concept_code'].astype(int)
+        # Use the get_concept_name function for each concept code
+        print("Looking up concept names...")
+        for idx, row in df[has_concepts].iterrows():
+            concept_code = int(row['concept_code'])
+            token = row['token']
+            
+            # Determine table type from token prefix
+            table_type = "UNKNOWN"
+            if token.startswith('CONDITION_'):
+                table_type = "CONDITION"
+            elif token.startswith('DRUG_'):
+                table_type = "DRUG"
+            elif token.startswith('MEASUREMENT_'):
+                table_type = "MEASUREMENT"
+            elif token.startswith('PROCEDURE_'):
+                table_type = "PROCEDURE"
+            elif token.startswith('OBSERVATION_'):
+                table_type = "OBSERVATION"
+            elif token.startswith('VISIT_'):
+                table_type = "VISIT"
+            
+            # Look up concept name
+            concept_name = get_concept_name(
+                table=table_type,
+                concept_id=concept_code,
+                concept_parquet_path=concept_parquet_path
+            )
+            
+            if concept_name:
+                df.loc[idx, 'interpretation'] = concept_name
+                df.loc[idx, 'concept_name'] = concept_name
+            else:
+                # Fallback to token prefix interpretation
+                df.loc[idx, 'interpretation'] = f"{table_type.lower().title()}: Concept {concept_code}"
         
-        # Merge back on concept_code to get human-readable names
-        df = df.merge(concept_mapping, how='left', on='concept_code')
-        
-        # Set interpretation to concept_name when available
-        df['interpretation'] = df['concept_name'].fillna(df['interpretation'])
-        
-        print(f"Successfully mapped {df['concept_name'].notna().sum()} concepts to names")
+        print(f"Successfully mapped concept names for {df['concept_name'].notna().sum()} concepts")
     else:
         df['interpretation'] = None
 
