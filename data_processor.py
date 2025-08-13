@@ -218,20 +218,33 @@ class OMOPDataProcessor:
     def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
         logger.info(f"[FAST] Writing partitioned events to {self.events_dir} ...")
         os.makedirs(self.events_dir, exist_ok=True)
-        # Collect lazily (streaming) then write partitioned with PyArrow dataset API
+        # Collect then write partitioned with visible progress
         try:
             df_events = events_lazy.collect()
             total_rows = df_events.height
             logger.info(f"[FAST] Events rows: {total_rows:,}")
-            tbl = df_events.to_arrow()
-            import pyarrow.dataset as pds
-            pds.write_dataset(
-                tbl,
-                base_dir=self.events_dir,
-                format="parquet",
-                partitioning=["pid_bucket"],
-                existing_data_behavior="overwrite_or_ignore"
-            )
+            # Partition by pid_bucket and write each group with a progress bar
+            from pathlib import Path
+            base = Path(self.events_dir)
+            base.mkdir(parents=True, exist_ok=True)
+            # Try dict output (newer Polars), else fall back to list
+            try:
+                parts = df_events.partition_by('pid_bucket', maintain_order=True, as_dict=True)
+                items = list(parts.items())
+            except Exception:
+                parts_list = df_events.partition_by('pid_bucket', maintain_order=True)
+                items = []
+                for part in parts_list:
+                    b = int(part.select('pid_bucket').head(1).item())
+                    items.append((b, part))
+            from tqdm import tqdm as _tqdm
+            for bucket, part in _tqdm(items, desc='[FAST] Writing partitions', unit='bucket'):
+                bucket_dir = base / f'pid_bucket={bucket}'
+                bucket_dir.mkdir(parents=True, exist_ok=True)
+                # Name per-bucket file
+                out_path = bucket_dir / 'part-000000.parquet'
+                part.drop_in_place('pid_bucket', True) if 'pid_bucket' in part.columns else None
+                part.write_parquet(str(out_path))
             logger.info("[FAST] Events written (partitioned by pid_bucket)")
         except Exception as e:
             logger.error(f"Error writing partitioned events: {e}")
