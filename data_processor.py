@@ -322,86 +322,84 @@ class OMOPDataProcessor:
         return concept_counts, quantile_mappings
     
     def _tokenize_from_partitions(self, person_data: Dict[int, Dict[str, Any]]) -> Dict[int, List[int]]:
-        logger.info("[FAST] Tokenizing per-person partitions (sequential)...")
+        logger.info("[FAST] Tokenizing per-person partitions...")
         tokenized: Dict[int, List[int]] = {}
         if not os.path.exists(self.events_dir):
             logger.error(f"Partitioned events directory not found: {self.events_dir}")
             return tokenized
-        # Iterate over pid_bucket partitions and group by person_id inside each file
         files = list(Path(self.events_dir).rglob('*.parquet'))
-        pbar_files = tqdm(files, desc="[FAST] Tokenizing partitions", unit="file")
-        pbar_patients = tqdm(total=0, desc="[FAST] Patients tokenized", unit="pt")
-        for file in pbar_files:
-            try:
-                df = pl.read_parquet(str(file))
-                if df.is_empty():
+
+        def process_file(file: Path) -> Dict[int, List[int]]:
+            local_tokenized: Dict[int, List[int]] = {}
+            df = pl.read_parquet(str(file))
+            if df.is_empty():
+                return local_tokenized
+            expected_cols = {"person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id"}
+            if not expected_cols.issubset(set(df.columns)):
+                return local_tokenized
+            df = df.sort(["person_id", "ts"]) 
+            gb = df.group_by("person_id")
+            for (pid,), sub in gb:
+                pid = int(pid)
+                pinfo = person_data.get(pid)
+                if not pinfo:
                     continue
-                # Ensure expected columns exist
-                expected_cols = {"person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id"}
-                missing = expected_cols - set(df.columns)
-                if missing:
-                    logger.warning(f"Skipping {file} due to missing columns: {missing}")
-                    continue
-                # Sort for deterministic order and group by person_id
-                df = df.sort(["person_id", "ts"]) 
-                # Update patient total for ETA
-                try:
-                    num_groups = int(df.get_column("person_id").n_unique())
-                    pbar_patients.total += num_groups
-                    pbar_patients.refresh()
-                except Exception:
-                    num_groups = None
-                gb = df.group_by("person_id")
-                for (pid,), sub in gb:
-                    pid = int(pid)
-                    if pid not in person_data:
+                sub = sub.sort("ts")
+                timeline: List[Dict[str, Any]] = [{
+                    'timestamp': pinfo.get('birth_datetime', datetime.now()),
+                    'event_type': 'static',
+                    'gender': pinfo.get('gender_concept_id'),
+                    'race': pinfo.get('race_concept_id'),
+                    'ethnicity': pinfo.get('ethnicity_concept_id'),
+                    'birth_year': pinfo.get('birth_year'),
+                    'data': pinfo,
+                }]
+                for row in sub.iter_rows(named=True):
+                    ts = row.get('ts')
+                    if ts is None:
                         continue
-                    sub = sub.sort("ts")
-                    # Build timeline
-                    pinfo = person_data[pid]
-                    timeline: List[Dict[str, Any]] = [{
-                        'timestamp': pinfo.get('birth_datetime', datetime.now()),
-                        'event_type': 'static',
-                        'gender': pinfo.get('gender_concept_id'),
-                        'race': pinfo.get('race_concept_id'),
-                        'ethnicity': pinfo.get('ethnicity_concept_id'),
-                        'birth_year': pinfo.get('birth_year'),
-                        'data': pinfo,
-                    }]
-                    for row in sub.iter_rows(named=True):
-                        ts = row.get('ts')
-                        if ts is None:
-                            continue
-                        et = row.get('et')
-                        cid = row.get('cid')
-                        val = row.get('value_as_number')
-                        unit = row.get('unit_concept_id')
-                        ev: Dict[str, Any] = {'timestamp': ts, 'event_type': et}
-                        if et == 'condition':
-                            ev['condition_concept_id'] = cid
-                        elif et == 'medication':
-                            ev['drug_concept_id'] = cid
-                        elif et == 'procedure':
-                            ev['procedure_concept_id'] = cid
-                        elif et == 'measurement':
-                            ev['measurement_concept_id'] = cid
-                            ev['value_as_number'] = val
-                            ev['unit_concept_id'] = unit
-                        elif et == 'observation':
-                            ev['observation_concept_id'] = cid
-                        timeline.append(ev)
-                    # Tokenize
-                    birth_year = pinfo.get('birth_year')
-                    current_year = datetime.now().year
-                    patient_age = (current_year - birth_year) if birth_year else 50
-                    tokens = self.tokenize_timeline(timeline, patient_age)
-                    tokenized[pid] = tokens
-                    pbar_patients.update(1)
-            except Exception as e:
-                logger.warning(f"Tokenization failed for {file}: {e}")
-                continue
-        pbar_files.close()
-        pbar_patients.close()
+                    et = row.get('et')
+                    cid = row.get('cid')
+                    val = row.get('value_as_number')
+                    unit = row.get('unit_concept_id')
+                    ev: Dict[str, Any] = {'timestamp': ts, 'event_type': et}
+                    if et == 'condition':
+                        ev['condition_concept_id'] = cid
+                    elif et == 'medication':
+                        ev['drug_concept_id'] = cid
+                    elif et == 'procedure':
+                        ev['procedure_concept_id'] = cid
+                    elif et == 'measurement':
+                        ev['measurement_concept_id'] = cid
+                        ev['value_as_number'] = val
+                        ev['unit_concept_id'] = unit
+                    elif et == 'observation':
+                        ev['observation_concept_id'] = cid
+                    timeline.append(ev)
+                birth_year = pinfo.get('birth_year')
+                current_year = datetime.now().year
+                patient_age = (current_year - birth_year) if birth_year else 50
+                tokens = self.tokenize_timeline(timeline, patient_age)
+                local_tokenized[pid] = tokens
+            return local_tokenized
+
+        # Parallel over files when many CPUs are available
+        if self.num_workers and self.num_workers > 1:
+            logger.info(f"[FAST] Parallel tokenization using {self.num_workers} workers")
+            from multiprocessing import Pool
+            with Pool(processes=self.num_workers) as pool:
+                for result in tqdm(pool.imap_unordered(process_file, files), total=len(files), desc='[FAST] Tokenizing partitions', unit='file'):
+                    if result:
+                        tokenized.update(result)
+        else:
+            for file in tqdm(files, desc='[FAST] Tokenizing partitions', unit='file'):
+                try:
+                    result = process_file(file)
+                    if result:
+                        tokenized.update(result)
+                except Exception as e:
+                    logger.warning(f"Tokenization failed for {file}: {e}")
+                    continue
         logger.info(f"[FAST] Tokenized {len(tokenized)} patients")
         return tokenized
     
