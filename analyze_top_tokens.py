@@ -285,12 +285,13 @@ def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.Data
     
     if concept_df is not None:
         print("Joining concept metadata...")
-        # First, get the original concept metadata
-        concept_cols = ['concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
+        # Use the actual columns from your OMOP concept table
+        concept_cols = ['concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code', 'concept_class_id', 'standard_concept']
         available_concept_cols = [c for c in concept_cols if c in concept_df.columns]
+        print(f"Available concept columns: {available_concept_cols}")
         
         if available_concept_cols:
-            # Join original concept metadata
+            # Join original concept metadata on concept_id
             ci_df = ci_df.merge(concept_df[available_concept_cols], how='left', on='concept_id')
             
             # If we have standard concepts, also get their metadata
@@ -338,27 +339,26 @@ def build_top_table(
     print("Extracting concept IDs from tokens...")
     parsed = df['token'].apply(parse_token)
     df['prefix'] = parsed.apply(lambda x: x[0])
-    df['concept_id'] = parsed.apply(lambda x: x[1])
-
-    # Map concept ids to standard concepts and names
-    has_concepts = df['concept_id'].notna()
+    df['concept_code'] = parsed.apply(lambda x: x[1])  # This is actually the concept_code, not concept_id
+    
+    # Map concept codes to concept names using OMOP concept table
+    has_concepts = df['concept_code'].notna()
     if has_concepts.any() and concept_df is not None:
-        concept_ids = df.loc[has_concepts, 'concept_id'].astype(int).tolist()
-        mapped = map_to_standard_concept(concept_ids, concept_df, rel_df)
-        # Check if mapped has the expected columns before merging
-        expected_cols = ['concept_id', 'standard_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
-        available_cols = [col for col in expected_cols if col in mapped.columns]
-        if len(available_cols) >= 2:  # Need at least concept_id and one other column
-            # Merge back on concept_id
-            df = df.merge(mapped[available_cols], how='left', on='concept_id')
-            # Interpretation preference: concept_name if present
-            if 'concept_name' in available_cols:
-                df['interpretation'] = df['concept_name']
-            else:
-                df['interpretation'] = None
-        else:
-            print(f"Warning: Mapped concept table missing expected columns. Available: {list(mapped.columns)}")
-            df['interpretation'] = None
+        concept_codes = df.loc[has_concepts, 'concept_code'].astype(int).tolist()
+        print(f"Found {len(concept_codes)} concept codes to map")
+        
+        # Map concept_code to concept_name using the OMOP concept table
+        # We need to join on concept_code, not concept_id
+        concept_mapping = concept_df[['concept_code', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_class_id']].copy()
+        concept_mapping['concept_code'] = concept_mapping['concept_code'].astype(int)
+        
+        # Merge back on concept_code to get human-readable names
+        df = df.merge(concept_mapping, how='left', on='concept_code')
+        
+        # Set interpretation to concept_name when available
+        df['interpretation'] = df['concept_name'].fillna(df['interpretation'])
+        
+        print(f"Successfully mapped {df['concept_name'].notna().sum()} concepts to names")
     else:
         df['interpretation'] = None
 
