@@ -534,6 +534,7 @@ def main() -> None:
     import argparse
     import pickle
     from sklearn.metrics import roc_auc_score
+    from tqdm import tqdm
 
     p = argparse.ArgumentParser(description="Evaluate next-year concept occurrence using tokenized timelines")
     p.add_argument("--model_path", type=str, required=True)
@@ -627,7 +628,7 @@ def main() -> None:
     y_true: Dict[str, List[int]] = {t: [] for t in targets}
 
     per_patient: Dict[int, Dict[str, float]] = {}
-    for i, pid in enumerate(overlap, start=1):
+    for i, pid in enumerate(tqdm(overlap, desc="Evaluating patients", unit="pt"), start=1):
         hist = current_tt.get(pid, [])
         fut = future_tt.get(pid, [])
         probs = generate_probs(hist)
@@ -636,8 +637,7 @@ def main() -> None:
         for key in targets:
             y_prob[key].append(probs.get(key, 0.0))
             y_true[key].append(labs.get(key, 0))
-        if i % 50 == 0:
-            print(f"Processed {i}/{len(overlap)} patients")
+        # tqdm handles progress output
 
     # AUROC per target
     aurocs: Dict[str, float] = {}
