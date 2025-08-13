@@ -57,7 +57,8 @@ class DataConfig:
     chunk_size: int = 10000  # Process data in chunks to manage memory
     max_patients_per_chunk: int = 5000  # Maximum patients to process in memory at once
     use_parallel_processing: bool = True  # Enable parallel processing for large datasets
-    memory_limit_gb: float = 8.0  # Memory limit for processing
+    # Memory limit for processing. Set to None for unlimited.
+    memory_limit_gb: float | None = None
 
 @dataclass
 class TokenConfig:

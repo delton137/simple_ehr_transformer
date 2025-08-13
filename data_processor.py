@@ -86,7 +86,7 @@ class OMOPDataProcessor:
         self.num_workers = num_workers or max(1, (os.cpu_count() or 4) - 1)
         
         # Memory monitoring
-        self.memory_limit_bytes = data_config.memory_limit_gb * 1024**3
+        self.memory_limit_bytes = None if data_config.memory_limit_gb is None else data_config.memory_limit_gb * 1024**3
         
         # Derived paths
         self.events_dir = os.path.join(data_config.output_dir, 'events_partitioned')
@@ -485,6 +485,8 @@ class OMOPDataProcessor:
 
     def check_memory_limit(self) -> bool:
         """Check if we're approaching memory limit"""
+        if self.memory_limit_bytes is None:
+            return True
         current_memory = self.get_memory_usage()
         return current_memory < self.memory_limit_bytes * 0.8
 
@@ -1530,7 +1532,10 @@ class OMOPDataProcessor:
         """Process all OMOP data and return tokenized timelines and vocabulary"""
         logger.info("Processing all OMOP data...")
         logger.info(f"Data directory: {self.omop_data_dir}")
-        logger.info(f"Memory limit: {data_config.memory_limit_gb:.1f} GB")
+        if data_config.memory_limit_gb is None:
+            logger.info("Memory limit: unlimited")
+        else:
+            logger.info(f"Memory limit: {data_config.memory_limit_gb:.1f} GB")
         logger.info(f"Engine: {self.engine}")
         
         if self.engine == 'polars' and pl is not None:
@@ -1636,7 +1641,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None,
                        help='Output directory for processed data (default: processed_data/)')
     parser.add_argument('--memory_limit', type=float, default=None,
-                       help='Memory limit in GB (default: 8.0)')
+                       help='Memory limit in GB (default: unlimited)')
     parser.add_argument('--force_reprocess', action='store_true',
                        help='Force reprocessing even if data exists')
     parser.add_argument('--tag', type=str, default=None,
