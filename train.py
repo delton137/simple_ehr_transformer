@@ -182,20 +182,18 @@ class ETHOSTrainer:
                 else:
                     self.optimizer.step()
                 self.scheduler.step()
-                # Increment global step after each optimizer update
                 self.global_step += 1
 
-                # Step-based validation
                 if self.validate_every_steps > 0 and (self.global_step % self.validate_every_steps == 0):
                     _val_t0 = time.time()
                     val_loss = self.validate_epoch()
                     _val_time = time.time() - _val_t0
-                    # Average across ranks if distributed
+
                     if dist.is_initialized():
                         tensor = torch.tensor([val_loss], device=self.device)
                         dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
                         val_loss = tensor.item()
-                    # Track best and log
+
                     is_best = val_loss < self.best_val_loss
                     if is_best:
                         self.best_val_loss = val_loss

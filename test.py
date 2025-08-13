@@ -19,9 +19,10 @@ import json
 import argparse
 import torch
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime, timedelta
 from model import create_ethos_model
+from sklearn.metrics import roc_auc_score
 
 
 # -----------------------------
@@ -54,11 +55,12 @@ def token_minutes_from_name(token_name: str) -> Optional[int]:
 def event_token_name_from_event(e: Dict) -> Optional[str]:
     et = e.get("event_type")
     if et == "condition":
-        return f"CONDITION_{e.get('condition_concept_id', 'unknown')}"
+        # Prefer table-inclusive prefix; retain legacy as fallback handled elsewhere
+        return f"CONDITION_OCCURRENCE_{e.get('condition_concept_id', 'unknown')}"
     if et == "medication":
-        return f"DRUG_{e.get('drug_concept_id', 'unknown')}"
+        return f"DRUG_EXPOSURE_{e.get('drug_concept_id', 'unknown')}"
     if et == "procedure":
-        return f"PROCEDURE_{e.get('procedure_concept_id', 'unknown')}"
+        return f"PROCEDURE_OCCURRENCE_{e.get('procedure_concept_id', 'unknown')}"
     if et == "measurement":
         return f"MEASUREMENT_{e.get('measurement_concept_id', 'unknown')}"
     if et == "observation":
@@ -131,6 +133,57 @@ class FutureTester:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # Hard-coded tokens to predict (Type 2 diabetes). Include legacy and table-inclusive.
+        # User provided: CONDITION_201826 (correct); earlier typo 20182 ignored.
+        self.tokens_to_predict: List[str] = [
+            "CONDITION_OCCURRENCE_201826",
+            "CONDITION_201826",
+        ]
+        # Map to actual vocab names present; allow flexible matching
+        self.token_variants: Dict[str, Set[str]] = self._resolve_token_variants(self.tokens_to_predict)
+
+    def _resolve_token_variants(self, desired_tokens: List[str]) -> Dict[str, Set[str]]:
+        """For each desired token, include both legacy and table-inclusive variants.
+        Does not require that variants exist in vocab; matching is done on names.
+        """
+        variants: Dict[str, Set[str]] = {}
+        pairs = [
+            ("CONDITION_OCCURRENCE_", "CONDITION_"),
+            ("DRUG_EXPOSURE_", "DRUG_"),
+            ("PROCEDURE_OCCURRENCE_", "PROCEDURE_"),
+        ]
+        for tok in desired_tokens:
+            s: Set[str] = set([tok])
+            for inc, leg in pairs:
+                if tok.startswith(inc):
+                    s.add(tok.replace(inc, leg, 1))
+                if tok.startswith(leg):
+                    s.add(tok.replace(leg, inc, 1))
+            variants[tok] = s
+        return variants
+
+    def _truth_occurrence_for_targets(self, current_events: List[Dict], future_events: List[Dict]) -> Dict[str, int]:
+        """Return a map canonical_token -> 0/1 indicating any occurrence in the horizon."""
+        index_time = self.last_event_time(current_events)
+        if index_time is None:
+            return {k: 0 for k in self.token_variants.keys()}
+        horizon_end = index_time + timedelta(days=self.forward_horizon_days)
+        names_in_horizon: Set[str] = set()
+        for e in future_events:
+            if e.get("event_type") == "static":
+                continue
+            ts = e.get("timestamp")
+            if not isinstance(ts, datetime):
+                continue
+            if index_time < ts <= horizon_end:
+                nm = event_token_name_from_event(e)
+                if nm:
+                    names_in_horizon.add(nm)
+        out: Dict[str, int] = {}
+        for canonical, alts in self.token_variants.items():
+            out[canonical] = 1 if any(n in names_in_horizon for n in alts) else 0
+        return out
+
     # -----------------
     # Index and history
     # -----------------
@@ -199,7 +252,12 @@ class FutureTester:
                     break
                 continue
             # record clinical events
-            if name.startswith(("CONDITION_", "DRUG_", "PROCEDURE_", "MEASUREMENT_", "OBSERVATION_")):
+            if name.startswith((
+                "CONDITION_", "CONDITION_OCCURRENCE_",
+                "DRUG_", "DRUG_EXPOSURE_",
+                "PROCEDURE_", "PROCEDURE_OCCURRENCE_",
+                "MEASUREMENT_", "OBSERVATION_",
+            )):
                 events_with_time.append((name, minutes))
         return events_with_time
 
@@ -220,12 +278,23 @@ class FutureTester:
                 token_occurrence_counts[name] = token_occurrence_counts.get(name, 0) + 1
         token_prob = {name: cnt / float(self.num_samples) for name, cnt in token_occurrence_counts.items()}
 
+        # Compute probabilities for tokens_to_predict (per canonical key)
+        targeted_prob: Dict[str, float] = {}
+        for canonical, variants in self.token_variants.items():
+            count = 0
+            for sim in sims:
+                present = any(name in variants for (name, _t) in sim)
+                if present:
+                    count += 1
+            targeted_prob[canonical] = count / float(self.num_samples)
+
         return {
             "pid": pid,
             "index_time": index_time.isoformat(),
             "history_len": len(history_ids),
             "simulations": sims,
             "predicted_event_prob": token_prob,
+            "targeted_prob": targeted_prob,
         }
 
     # -----------------
@@ -332,8 +401,8 @@ class FutureTester:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate future timelines and compare to future OMOP ground truth")
     p.add_argument("--model_path", type=str, required=True, help="Path to trained model checkpoint")
-    p.add_argument("--current_data_dir", type=str, default="processed_data", help="Processed data dir for current patients")
-    p.add_argument("--future_data_dir", type=str, default=None, help="Processed data dir for future OMOP (for ground truth)")
+    p.add_argument("--current_data_dir", type=str, default="processed_data", help="Processed data dir for current patients (e.g., pre_2023)")
+    p.add_argument("--future_data_dir", type=str, default=None, help="Processed data dir for future OMOP (e.g., 2023) for ground truth")
     p.add_argument("--output_dir", type=str, default="test_results", help="Output directory for simulations and metrics")
     p.add_argument("--device", type=str, default="auto", help="cpu, cuda, or auto")
     p.add_argument("--forward_horizon_days", type=int, default=365)
@@ -362,7 +431,58 @@ def main() -> None:
         top_p=args.top_p,
         patient_limit=args.patient_limit,
     )
-    tester.run()
+    # Run simulation and compute AUROC for tokens_to_predict using future data
+    pids = list(tester.current_timelines.keys())
+    if tester.patient_limit is not None:
+        pids = pids[: tester.patient_limit]
+
+    # Storage for predictions and labels per target
+    y_prob: Dict[str, List[float]] = {t: [] for t in tester.token_variants.keys()}
+    y_true: Dict[str, List[int]] = {t: [] for t in tester.token_variants.keys()}
+
+    per_patient_outputs: Dict[int, Dict] = {}
+
+    for i, pid in enumerate(pids, start=1):
+        cur_events = tester.current_timelines[pid]
+        out = tester.simulate_patient(pid, cur_events)
+        per_patient_outputs[pid] = out
+
+        # Ground-truth from future dataset within horizon
+        truth_map: Dict[str, int] = {}
+        if tester.future_timelines is not None and pid in tester.future_timelines:
+            truth_map = tester._truth_occurrence_for_targets(
+                current_events=cur_events,
+                future_events=tester.future_timelines[pid],
+            )
+        else:
+            truth_map = {k: 0 for k in tester.token_variants.keys()}
+
+        # Append per-target probabilities and labels
+        for tok in tester.token_variants.keys():
+            y_prob[tok].append(out["targeted_prob"].get(tok, 0.0))
+            y_true[tok].append(int(truth_map.get(tok, 0)))
+
+        if i % 25 == 0:
+            print(f"Processed {i}/{len(pids)} patients...")
+
+    # Compute AUROC per token
+    metrics: Dict[str, float] = {}
+    for tok in tester.token_variants.keys():
+        try:
+            metrics[tok] = roc_auc_score(y_true[tok], y_prob[tok])
+        except Exception:
+            metrics[tok] = float("nan")
+
+    # Save outputs
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "per_patient_predictions.json"), "w") as f:
+        json.dump(per_patient_outputs, f, indent=2)
+    with open(os.path.join(args.output_dir, "auroc_per_token.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("AUROC per token:")
+    for tok, auc in metrics.items():
+        print(f"  {tok}: {auc}")
 
 
 if __name__ == "__main__":

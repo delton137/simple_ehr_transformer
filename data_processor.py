@@ -80,6 +80,16 @@ class OMOPDataProcessor:
         # Derived paths
         self.events_dir = os.path.join(data_config.output_dir, 'events_partitioned')
     
+        # Event type mappings to table-inclusive prefixes
+        # Examples: CONDITION_OCCURRENCE_123, DRUG_EXPOSURE_456, PROCEDURE_OCCURRENCE_789
+        self.event_type_prefix = {
+            "condition": "CONDITION_OCCURRENCE_",
+            "medication": "DRUG_EXPOSURE_",
+            "procedure": "PROCEDURE_OCCURRENCE_",
+            "measurement": "MEASUREMENT_",
+            "observation": "OBSERVATION_",
+        }
+
     # =====================
     # Fast path (Polars)
     # =====================
@@ -284,14 +294,9 @@ class OMOPDataProcessor:
         concept_counts: Counter = Counter()
         for et, cid, n in counts.iter_rows():
             if et in ("condition", "medication", "procedure", "measurement", "observation"):
-                prefix = {
-                    "condition": "CONDITION_",
-                    "medication": "DRUG_",
-                    "procedure": "PROCEDURE_",
-                    "measurement": "MEASUREMENT_",
-                    "observation": "OBSERVATION_",
-                }[et]
-                concept_counts[f"{prefix}{cid}"] += int(n)
+                pref = self.event_type_prefix.get(et, f"{et.upper()}_")
+                token_key = f"{pref}{int(cid)}"
+                concept_counts[token_key] += int(n)
         
         logger.info("[FAST] Computing measurement quantiles (Polars)...")
         meas = events_lazy.filter(pl.col("et") == "measurement").select(["cid", "value_as_number"]).drop_nulls()
@@ -461,6 +466,7 @@ class OMOPDataProcessor:
         # Add concept tokens up to capacity
         max_concepts = model_config.vocab_size - len(self.vocab)
         for concept, _n in concept_counts.most_common(max_concepts):
+            # concept already includes table suffix
             self.vocab[concept] = len(self.vocab)
         self.vocab_size = len(self.vocab)
         logger.info(f"[FAST] Vocabulary size: {self.vocab_size}")
@@ -1293,13 +1299,13 @@ class OMOPDataProcessor:
                 for event in timeline:
                     if event['event_type'] == 'condition':
                         concept_id = event.get('condition_concept_id', 'unknown')
-                        concept_counts[f"CONDITION_{concept_id}"] += 1
+                        concept_counts[f"CONDITION_OCCURRENCE_{concept_id}"] += 1
                     elif event['event_type'] == 'medication':
                         concept_id = event.get('drug_concept_id', 'unknown')
-                        concept_counts[f"DRUG_{concept_id}"] += 1
+                        concept_counts[f"DRUG_EXPOSURE_{concept_id}"] += 1
                     elif event['event_type'] == 'procedure':
                         concept_id = event.get('procedure_concept_id', 'unknown')
-                        concept_counts[f"PROCEDURE_{concept_id}"] += 1
+                        concept_counts[f"PROCEDURE_OCCURRENCE_{concept_id}"] += 1
                     elif event['event_type'] == 'measurement':
                         concept_id = event.get('measurement_concept_id', 'unknown')
                         concept_counts[f"MEASUREMENT_{concept_id}"] += 1
@@ -1330,7 +1336,7 @@ class OMOPDataProcessor:
         logger.info(f"  - Age intervals: {len(self.age_mappings)}")
         logger.info(f"  - Time intervals: {len(self.time_interval_mappings)}")
         logger.info(f"  - Quantile tokens: {model_config.max_quantile_tokens}")
-        logger.info(f"  - Concept tokens: {len([k for k in self.vocab.keys() if k.startswith(('CONDITION_', 'DRUG_', 'PROCEDURE_', 'MEASUREMENT_', 'OBSERVATION_'))])}")
+        logger.info(f"  - Concept tokens: {len([k for k in self.vocab.keys() if k.startswith(('CONDITION_OCCURRENCE_', 'DRUG_EXPOSURE_', 'PROCEDURE_OCCURRENCE_', 'MEASUREMENT_', 'OBSERVATION_'))])}")
     
     def tokenize_timeline(self, timeline: List[Dict], patient_age: float) -> List[int]:
         """Convert a patient timeline to tokens"""
@@ -1409,19 +1415,27 @@ class OMOPDataProcessor:
             
         elif event_type == 'condition':
             concept_id = event.get('condition_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"CONDITION_{concept_id}", 0))
+            pref = self.event_type_prefix.get('condition', 'CONDITION_')
+            token_key = f"{pref}{concept_id}"
+            tokens.append(self.vocab.get(token_key, 0))
             
         elif event_type == 'medication':
             concept_id = event.get('drug_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"DRUG_{concept_id}", 0))
+            pref = self.event_type_prefix.get('medication', 'DRUG_')
+            token_key = f"{pref}{concept_id}"
+            tokens.append(self.vocab.get(token_key, 0))
             
         elif event_type == 'procedure':
             concept_id = event.get('procedure_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"PROCEDURE_{concept_id}", 0))
+            pref = self.event_type_prefix.get('procedure', 'PROCEDURE_')
+            token_key = f"{pref}{concept_id}"
+            tokens.append(self.vocab.get(token_key, 0))
             
         elif event_type == 'measurement':
             concept_id = event.get('measurement_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"MEASUREMENT_{concept_id}", 0))
+            pref = self.event_type_prefix.get('measurement', 'MEASUREMENT_')
+            token_key = f"{pref}{concept_id}"
+            tokens.append(self.vocab.get(token_key, 0))
             
             # Value quantile token
             value = event.get('value_as_number')
@@ -1435,7 +1449,9 @@ class OMOPDataProcessor:
             tokens.append(self.vocab.get(f"UNIT_{unit}", 0))
         elif event_type == 'observation':
             concept_id = event.get('observation_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"OBSERVATION_{concept_id}", 0))
+            pref = self.event_type_prefix.get('observation', 'OBSERVATION_')
+            token_key = f"{pref}{concept_id}"
+            tokens.append(self.vocab.get(token_key, 0))
         
         return tokens
     

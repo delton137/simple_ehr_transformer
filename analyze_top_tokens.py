@@ -120,9 +120,9 @@ def get_concept_names_batch(
 
 
 CONCEPT_PREFIXES = (
-    "CONDITION_",
-    "DRUG_",
-    "PROCEDURE_",
+    "CONDITION_OCCURRENCE_",
+    "DRUG_EXPOSURE_",
+    "PROCEDURE_OCCURRENCE_",
     "MEASUREMENT_",
     "OBSERVATION_",
     "UNIT_",
@@ -150,15 +150,19 @@ def count_token_frequencies(tokenized_timelines: Dict[int, List[int]]) -> Counte
 
 
 def parse_token(token_str: str) -> Tuple[Optional[str], Optional[int]]:
-    """Return (prefix_without_trailing_, concept_id) if token encodes an OMOP concept, else (None, None)."""
+    """Return (prefix_without_trailing_, concept_id) if token encodes an OMOP concept, else (None, None).
+
+    Supports table-inclusive prefixes like CONDITION_OCCURRENCE_<cid>
+    """
     for prefix in CONCEPT_PREFIXES:
         if token_str.startswith(prefix):
-            suffix = token_str[len(prefix):]
+            # Strip optional provenance suffix
+            core = token_str.split("__TABLE_", 1)[0]
+            suffix = core[len(prefix):]
             try:
                 cid = int(suffix)
             except Exception:
                 return None, None
-            # Normalize prefix label without trailing underscore
             return prefix[:-1], cid
     return None, None
 

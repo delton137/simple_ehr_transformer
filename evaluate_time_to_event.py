@@ -66,19 +66,19 @@ def build_target_token_ids(
 ) -> List[int]:
     """Construct list of target token IDs to detect in generated futures.
 
-    - If event_type and concept_ids are provided, builds tokens like f"CONDITION_{cid}".
+    - If event_type and concept_ids are provided, builds tokens like CONDITION_OCCURRENCE_<cid>.
     - If token_regexes provided, matches any vocab tokens by regex and adds their IDs.
     """
     target_ids: List[int] = []
 
     if event_type and concept_ids:
         prefix_map = {
-            "condition": "CONDITION_",
-            "medication": "DRUG_",
-            "procedure": "PROCEDURE_",
+            "condition": "CONDITION_OCCURRENCE_",
+            "medication": "DRUG_EXPOSURE_",
+            "procedure": "PROCEDURE_OCCURRENCE_",
             "measurement": "MEASUREMENT_",
             "observation": "OBSERVATION_",
-            "death": "DEATH",  # typically event token, not concept; kept for completeness
+            "death": "DEATH",
         }
         prefix = prefix_map.get(event_type.lower())
         if prefix:
@@ -259,11 +259,11 @@ class TimeToEventEvaluator:
         # Derive textual prefixes for quick checking
         if self.cfg.event_type and self.cfg.concept_ids:
             if self.cfg.event_type.lower() == "condition":
-                target_prefixes = [f"CONDITION_{cid}" for cid in self.cfg.concept_ids]
+                target_prefixes = [f"CONDITION_OCCURRENCE_{cid}" for cid in self.cfg.concept_ids]
             elif self.cfg.event_type.lower() == "medication":
-                target_prefixes = [f"DRUG_{cid}" for cid in self.cfg.concept_ids]
+                target_prefixes = [f"DRUG_EXPOSURE_{cid}" for cid in self.cfg.concept_ids]
             elif self.cfg.event_type.lower() == "procedure":
-                target_prefixes = [f"PROCEDURE_{cid}" for cid in self.cfg.concept_ids]
+                target_prefixes = [f"PROCEDURE_OCCURRENCE_{cid}" for cid in self.cfg.concept_ids]
             elif self.cfg.event_type.lower() == "measurement":
                 target_prefixes = [f"MEASUREMENT_{cid}" for cid in self.cfg.concept_ids]
 
@@ -278,11 +278,11 @@ class TimeToEventEvaluator:
                 if target_prefixes:
                     # Identify the concept token name this event would produce
                     if e.get("event_type") == "condition":
-                        name = f"CONDITION_{e.get('condition_concept_id', 'unknown')}"
+                        name = f"CONDITION_OCCURRENCE_{e.get('condition_concept_id', 'unknown')}"
                     elif e.get("event_type") == "medication":
-                        name = f"DRUG_{e.get('drug_concept_id', 'unknown')}"
+                        name = f"DRUG_EXPOSURE_{e.get('drug_concept_id', 'unknown')}"
                     elif e.get("event_type") == "procedure":
-                        name = f"PROCEDURE_{e.get('procedure_concept_id', 'unknown')}"
+                        name = f"PROCEDURE_OCCURRENCE_{e.get('procedure_concept_id', 'unknown')}"
                     elif e.get("event_type") == "measurement":
                         name = f"MEASUREMENT_{e.get('measurement_concept_id', 'unknown')}"
                     else:
@@ -295,11 +295,11 @@ class TimeToEventEvaluator:
                     if self.cfg.token_regexes:
                         constructed: List[str] = []
                         if e.get("event_type") == "condition":
-                            constructed.append(f"CONDITION_{e.get('condition_concept_id', 'unknown')}")
+                            constructed.append(f"CONDITION_OCCURRENCE_{e.get('condition_concept_id', 'unknown')}")
                         if e.get("event_type") == "medication":
-                            constructed.append(f"DRUG_{e.get('drug_concept_id', 'unknown')}")
+                            constructed.append(f"DRUG_EXPOSURE_{e.get('drug_concept_id', 'unknown')}")
                         if e.get("event_type") == "procedure":
-                            constructed.append(f"PROCEDURE_{e.get('procedure_concept_id', 'unknown')}")
+                            constructed.append(f"PROCEDURE_OCCURRENCE_{e.get('procedure_concept_id', 'unknown')}")
                         if e.get("event_type") == "measurement":
                             constructed.append(f"MEASUREMENT_{e.get('measurement_concept_id', 'unknown')}")
                         for name in constructed:
