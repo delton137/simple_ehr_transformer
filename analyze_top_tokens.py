@@ -26,6 +26,7 @@ import json
 import pickle
 from tqdm import tqdm
 import polars as pl
+import pyarrow
 from pathlib import Path
 
 from config import data_config
@@ -330,9 +331,26 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
                         table = table.cast(new_schema)
                         print(f"✅ Successfully cast table")
                     
-                    df = table.to_pandas()
-                    print(f"✅ Successfully converted to pandas: {df.shape}")
-                    dfs.append(df)
+                    # Handle the dbdate issue in schema metadata by creating a clean schema
+                    try:
+                        df = table.to_pandas()
+                        print(f"✅ Successfully converted to pandas: {df.shape}")
+                        dfs.append(df)
+                    except Exception as pandas_error:
+                        if "dbdate" in str(pandas_error).lower():
+                            print("⚠️  dbdate issue in pandas conversion, trying alternative approach...")
+                            # Create a new table with clean schema metadata
+                            clean_schema = pyarrow.schema([
+                                pyarrow.field(field.name, field.type) 
+                                for field in table.schema
+                            ])
+                            clean_table = table.cast(clean_schema)
+                            df = clean_table.to_pandas()
+                            print(f"✅ Successfully converted to pandas with clean schema: {df.shape}")
+                            dfs.append(df)
+                        else:
+                            raise pandas_error
+                            
                 except Exception as e3:
                     print(f"❌ Failed to load with dbdate conversion: {e3}")
                     import traceback
@@ -669,7 +687,7 @@ def main():
     parser.add_argument('--data_dir', type=str, default=None, help='Processed data directory (default: processed_data or processed_data_{tag})')
     parser.add_argument('--tag', type=str, default=None, help='Dataset tag to locate processed_data_{tag}')
     parser.add_argument('--omop_dir', type=str, default=None, help='OMOP data directory containing concept/ and concept_relationship/')
-    parser.add_argument('--top_k', type=int, default=100, help='Number of top tokens to report (default: 100)')
+    parser.add_argument('--top_k', type=int, default=1000, help='Number of top tokens to report (default: 1000)')
     parser.add_argument('--include_misc', action='store_true', help='Include non-concept tokens (EVENT_/AGE_/TIME_/etc.)')
     parser.add_argument('--output_csv', type=str, default=None, help='Path to save CSV (default: {data_dir}/top_tokens.csv)')
 
@@ -770,15 +788,15 @@ def main():
     )
 
     # Display preview
-    print(f"\n📋 Top {min(10, len(table))} Tokens Preview:")
+    print(f"\n📋 Top {min(20, len(table))} Tokens Preview:")
     preview_cols = ['token', 'raw_count', 'frequency_percent', 'interpretation']
     available_preview_cols = [col for col in preview_cols if col in table.columns]
     
     with pd.option_context('display.max_colwidth', 50, 'display.width', 120):
-        print(table[available_preview_cols].head(10).to_string(index=False))
+        print(table[available_preview_cols].head(20).to_string(index=False))
     
-    if len(table) > 10:
-        print(f"... and {len(table) - 10} more tokens")
+    if len(table) > 20:
+        print(f"... and {len(table) - 20} more tokens")
 
     # Save to CSV
     output_csv = args.output_csv
