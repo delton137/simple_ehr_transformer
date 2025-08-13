@@ -16,16 +16,106 @@ Notes:
 - Can include non-concept tokens with --include_misc
 """
 
-import os
-import argparse
-import pickle
-from typing import Dict, List, Tuple, Optional
-from collections import Counter
-
 import pandas as pd
+import numpy as np
+from collections import Counter
+from typing import Dict, List, Optional, Tuple
+import argparse
+import os
+import json
+import pickle
 from tqdm import tqdm
+import polars as pl
+from pathlib import Path
 
 from config import data_config
+
+
+def get_concept_name(
+    table: str,
+    concept_id: int,
+    concept_parquet_path: str | Path
+) -> str | None:
+    """
+    Look up the OMOP concept_name for a given concept_id using Polars.
+
+    Parameters
+    ----------
+    table : str
+        Name of the OMOP table (not used for lookup, but included for clarity/logging).
+    concept_id : int
+        The concept_id to look up.
+    concept_parquet_path : str | Path
+        Path to the OMOP concept table parquet file.
+
+    Returns
+    -------
+    str | None
+        The concept_name if found, else None.
+    """
+    try:
+        # Load only needed columns to save memory
+        concept_df = pl.read_parquet(concept_parquet_path, columns=["concept_id", "concept_name"])
+
+        result = (
+            concept_df
+            .filter(pl.col("concept_id") == concept_id)
+            .select("concept_name")
+            .to_series()
+        )
+
+        if result.is_empty():
+            print(f"[WARN] concept_id {concept_id} not found in {table}.")
+            return None
+        
+        # Return as plain Python string
+        return result[0]
+    except Exception as e:
+        print(f"[ERROR] Failed to lookup concept_id {concept_id} in {table}: {e}")
+        return None
+
+
+def get_concept_names_batch(
+    concept_codes: List[int],
+    concept_parquet_path: str | Path
+) -> Dict[int, str]:
+    """
+    Batch lookup concept names for multiple concept codes.
+    
+    Parameters
+    ----------
+    concept_codes : List[int]
+        List of concept codes to look up.
+    concept_parquet_path : str | Path
+        Path to the OMOP concept table parquet file.
+        
+    Returns
+    -------
+    Dict[int, str]
+        Mapping from concept_code to concept_name.
+    """
+    try:
+        # Load only needed columns to save memory
+        concept_df = pl.read_parquet(concept_parquet_path, columns=["concept_id", "concept_name"])
+        
+        # Filter to only the concept codes we need
+        result_df = (
+            concept_df
+            .filter(pl.col("concept_id").is_in(concept_codes))
+            .select(["concept_id", "concept_name"])
+        )
+        
+        # Convert to dictionary
+        concept_names = {}
+        for row in result_df.iter_rows():
+            concept_names[row[0]] = row[1]
+        
+        print(f"Successfully mapped {len(concept_names)} out of {len(concept_codes)} concept codes")
+        return concept_names
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to batch lookup concepts: {e}")
+        return {}
 
 
 CONCEPT_PREFIXES = (
@@ -311,7 +401,7 @@ def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.Data
 def build_top_table(
     counts: Counter,
     id_to_token: Dict[int, str],
-    concept_df: Optional[pd.DataFrame],
+    concept_parquet_path: Optional[str],
     rel_df: Optional[pd.DataFrame],
     top_k: int,
     concept_only: bool,
@@ -343,13 +433,14 @@ def build_top_table(
     
     # Map concept codes to concept names using OMOP concept table
     has_concepts = df['concept_code'].notna()
-    if has_concepts.any() and concept_df is not None:
+    if has_concepts.any() and concept_parquet_path:
+        print(f"Using Polars-based concept lookup for {len(concept_parquet_path)} concept files...")
         concept_codes = df.loc[has_concepts, 'concept_code'].astype(int).tolist()
         print(f"Found {len(concept_codes)} concept codes to map")
         
         # Map concept_code to concept_name using the OMOP concept table
         # We need to join on concept_code, not concept_id
-        concept_mapping = concept_df[['concept_code', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_class_id']].copy()
+        concept_mapping = pl.read_parquet(concept_parquet_path, columns=["concept_code", "concept_name", "domain_id", "vocabulary_id", "concept_class_id"]).to_pandas()
         concept_mapping['concept_code'] = concept_mapping['concept_code'].astype(int)
         
         # Merge back on concept_code to get human-readable names
@@ -571,22 +662,25 @@ def main():
 
     # Load OMOP concept tables (best-effort)
     print("Loading OMOP concept tables...")
-    concept_df = None
-    rel_df = None
-    
-    try:
-        concept_df = read_concept_table(omop_dir)
-        if concept_df is not None:
-            print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
-            print(f"   Available columns: {list(concept_df.columns)}")
-            if 'concept_name' in concept_df.columns:
-                print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
+    concept_parquet_path = None
+    if omop_dir:
+        concept_dir = os.path.join(omop_dir, 'concept')
+        if os.path.isdir(concept_dir):
+            concept_files = [f for f in os.listdir(concept_dir) if f.endswith('.parquet')]
+            if concept_files:
+                concept_parquet_path = os.path.join(concept_dir, concept_files[0])
+                print(f"✅ Found concept table: {concept_parquet_path}")
+            else:
+                print("⚠️  No concept parquet files found in concept directory")
         else:
-            print("⚠️  No concept table available - will use fallback interpretations")
-    except Exception as e:
-        print(f"⚠️  Failed to load concept table: {e}")
-        print("Will continue with fallback interpretations")
+            print("⚠️  Concept directory not found")
     
+    if concept_parquet_path:
+        print("ℹ️  Will use Polars-based concept lookup for efficient mapping")
+    else:
+        print("ℹ️  No concept table available - will use fallback interpretations only")
+    
+    # Try to load relationship table if available
     try:
         rel_df = read_concept_relationship_table(omop_dir)
         if rel_df is not None:
@@ -598,14 +692,14 @@ def main():
         print(f"⚠️  Failed to load relationship table: {e}")
         print("Will continue without relationship data")
     
-    if concept_df is None and rel_df is None:
+    if concept_parquet_path is None and rel_df is None:
         print("ℹ️  Running with fallback interpretations only - no OMOP concept data available")
 
     # Build table
     table = build_top_table(
         counts=counts,
         id_to_token=id_to_token,
-        concept_df=concept_df,
+        concept_parquet_path=concept_parquet_path,
         rel_df=rel_df,
         top_k=args.top_k,
         concept_only=(not args.include_misc),
