@@ -68,7 +68,6 @@ class ETHOSTrainer:
         else:
             self.scaler = None
         
-        # Training state
         self.current_epoch = 0
         self.best_val_loss = float('inf')
         self.last_val_loss: Optional[float] = None
@@ -387,12 +386,10 @@ class ETHOSTrainer:
         for epoch in range(self.current_epoch, self.config['max_epochs']):
             self.current_epoch = epoch
             
-            # Train
             start_time = time.time()
             train_loss = self.train_epoch()
             train_time = time.time() - start_time
             
-            # Validate (only on rank 0 to save time, or on all ranks and average)
             _val_t0_epoch = time.time()
             val_loss = self.validate_epoch()
             val_time_epoch = time.time() - _val_t0_epoch
@@ -578,7 +575,7 @@ def main():
             print("  Training timeline length histogram:")
             for k in ['0-10','10-20','20-100','100-200','200-800','>800']:
                 print(f"    {k}: {buckets[k]}")
-        # Drop last batch in train to avoid uneven last batch across ranks
+
         train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
         val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
         print(f"✅ Training batches: {len(train_loader)}")
