@@ -394,6 +394,9 @@ class FutureTester:
     # -----------------
     def run(self) -> None:
         pids = list(self.current_timelines.keys())
+        if self.future_timelines is not None:
+            pids = [pid for pid in pids if pid in self.future_timelines]
+            print(f"Evaluating on {len(pids)} patients present in both current and future datasets")
         if self.patient_limit is not None:
             pids = pids[: self.patient_limit]
 
@@ -493,6 +496,9 @@ def main() -> None:
     )
     # Run simulation and compute AUROC for tokens_to_predict using future data
     pids = list(tester.current_timelines.keys())
+    if tester.future_timelines is not None:
+        pids = [pid for pid in pids if pid in tester.future_timelines]
+        print(f"Evaluating on {len(pids)} patients present in both current and future datasets")
     if tester.patient_limit is not None:
         pids = pids[: tester.patient_limit]
 
