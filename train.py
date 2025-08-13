@@ -8,7 +8,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import logging
 import argparse
 from tqdm import tqdm
@@ -21,9 +20,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import csv
 
-from config import model_config, data_config
+from config import model_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
-from model import create_small_ethos_model, SmallETHOSTransformer
+from model import create_ethos_model, SmallETHOSTransformer
 
 # Set up logging
 logging.basicConfig(
@@ -641,7 +640,7 @@ def main():
     if is_rank0:
         print("\n🏗️  Creating model...")
     try:
-        model = create_small_ethos_model(len(vocab))
+        model = create_ethos_model(len(vocab))
         model = model.to(device)
         if ddp:
             # Use static_graph to reduce collective overhead when graph is fixed

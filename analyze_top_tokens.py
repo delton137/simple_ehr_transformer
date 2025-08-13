@@ -72,6 +72,24 @@ def parse_token(token_str: str) -> Tuple[Optional[str], Optional[int]]:
     return None, None
 
 
+def convert_dbdate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert dbdate columns to timestamp to avoid loading errors."""
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Check if this might be a dbdate column
+            sample_values = df[col].dropna().head(100)
+            if len(sample_values) > 0:
+                try:
+                    # Try to convert to datetime
+                    pd.to_datetime(sample_values, errors='coerce')
+                    # If successful, convert the entire column
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    print(f"Converted column {col} from dbdate to datetime")
+                except:
+                    pass
+    return df
+
+
 def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
     concept_dir = os.path.join(omop_dir, 'concept')
     if not os.path.isdir(concept_dir):
@@ -94,7 +112,28 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
                 dfs.append(df)
             except Exception as e2:
                 print(f"Failed to load {fp} with fastparquet: {e2}")
-                continue
+                # Try with manual dbdate handling
+                try:
+                    print(f"Attempting to load with manual dbdate conversion...")
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(fp)
+                    # Convert dbdate columns
+                    schema = table.schema
+                    new_fields = []
+                    for field in schema:
+                        if str(field.type) == 'dbdate':
+                            new_fields.append(pyarrow.field(field.name, pyarrow.timestamp('ns')))
+                        else:
+                            new_fields.append(field)
+                    new_schema = pyarrow.schema(new_fields)
+                    # Cast the table
+                    table = table.cast(new_schema)
+                    df = table.to_pandas()
+                    print(f"Successfully loaded with dbdate conversion")
+                    dfs.append(df)
+                except Exception as e3:
+                    print(f"Failed to load with dbdate conversion: {e3}")
+                    continue
     if not dfs:
         print("No concept files could be loaded successfully")
         return None
@@ -141,7 +180,28 @@ def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
                 dfs.append(df)
             except Exception as e2:
                 print(f"Failed to load {fp} with fastparquet: {e2}")
-                continue
+                # Try with manual dbdate handling
+                try:
+                    print(f"Attempting to load with manual dbdate conversion...")
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(fp)
+                    # Convert dbdate columns
+                    schema = table.schema
+                    new_fields = []
+                    for field in schema:
+                        if str(field.type) == 'dbdate':
+                            new_fields.append(pyarrow.field(field.name, pyarrow.timestamp('ns')))
+                        else:
+                            new_fields.append(field)
+                    new_schema = pyarrow.schema(new_fields)
+                    # Cast the table
+                    table = table.cast(new_schema)
+                    df = table.to_pandas()
+                    print(f"Successfully loaded with dbdate conversion")
+                    dfs.append(df)
+                except Exception as e3:
+                    print(f"Failed to load with dbdate conversion: {e3}")
+                    continue
     if not dfs:
         print("No relationship files could be loaded successfully")
         return None
@@ -264,7 +324,18 @@ def build_top_table(
 
     # Final sort and trim to top_k
     print(f"Finalizing top {top_k} tokens...")
-    df = df[['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation', 'concept_id', 'domain_id', 'vocabulary_id', 'concept_code']]
+    # Final column selection - only include columns that exist
+    available_cols = ['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation']
+    if 'concept_id' in df.columns:
+        available_cols.append('concept_id')
+    if 'domain_id' in df.columns:
+        available_cols.append('domain_id')
+    if 'vocabulary_id' in df.columns:
+        available_cols.append('vocabulary_id')
+    if 'concept_code' in df.columns:
+        available_cols.append('concept_code')
+    
+    df = df[available_cols]
     df = df.sort_values('raw_count', ascending=False).head(top_k).reset_index(drop=True)
     return df
 
