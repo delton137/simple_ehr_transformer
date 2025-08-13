@@ -92,51 +92,75 @@ def convert_dbdate_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
     concept_dir = os.path.join(omop_dir, 'concept')
+    print(f"Looking for concept directory: {concept_dir}")
     if not os.path.isdir(concept_dir):
-        print(f"Concept directory not found: {concept_dir}")
+        print(f"❌ Concept directory not found: {concept_dir}")
+        print(f"Available directories in {omop_dir}: {os.listdir(omop_dir) if os.path.exists(omop_dir) else 'Directory does not exist'}")
         return None
+    
     files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
     if not files:
-        print(f"No parquet files found in concept directory: {concept_dir}")
+        print(f"❌ No parquet files found in concept directory: {concept_dir}")
+        print(f"Files in concept directory: {os.listdir(concept_dir)}")
         return None
+    
     print(f"Loading concept table from {len(files)} parquet files...")
+    print(f"Files: {files}")
     dfs: List[pd.DataFrame] = []
+    
     for fp in tqdm(files, desc="Loading concept files", unit="file"):
+        print(f"Attempting to load: {fp}")
         try:
             df = pd.read_parquet(fp, engine='pyarrow')
+            print(f"✅ Successfully loaded with pyarrow: {df.shape}")
             dfs.append(df)
         except Exception as e:
-            print(f"Failed to load {fp} with pyarrow: {e}")
+            print(f"❌ Failed to load {fp} with pyarrow: {e}")
             try:
                 df = pd.read_parquet(fp, engine='fastparquet')
+                print(f"✅ Successfully loaded with fastparquet: {df.shape}")
                 dfs.append(df)
             except Exception as e2:
-                print(f"Failed to load {fp} with fastparquet: {e2}")
+                print(f"❌ Failed to load {fp} with fastparquet: {e2}")
                 # Try with manual dbdate handling
                 try:
                     print(f"Attempting to load with manual dbdate conversion...")
                     import pyarrow.parquet as pq
                     table = pq.read_table(fp)
+                    print(f"✅ Successfully read with pyarrow.parquet: {table.shape}")
+                    print(f"Schema: {table.schema}")
+                    
                     # Convert dbdate columns
                     schema = table.schema
                     new_fields = []
                     for field in schema:
                         if str(field.type) == 'dbdate':
                             new_fields.append(pyarrow.field(field.name, pyarrow.timestamp('ns')))
+                            print(f"Converting dbdate field: {field.name}")
                         else:
                             new_fields.append(field)
-                    new_schema = pyarrow.schema(new_fields)
-                    # Cast the table
-                    table = table.cast(new_schema)
+                    
+                    if new_fields != list(schema):
+                        new_schema = pyarrow.schema(new_fields)
+                        print(f"New schema: {new_schema}")
+                        # Cast the table
+                        table = table.cast(new_schema)
+                        print(f"✅ Successfully cast table")
+                    
                     df = table.to_pandas()
-                    print(f"Successfully loaded with dbdate conversion")
+                    print(f"✅ Successfully converted to pandas: {df.shape}")
                     dfs.append(df)
                 except Exception as e3:
-                    print(f"Failed to load with dbdate conversion: {e3}")
+                    print(f"❌ Failed to load with dbdate conversion: {e3}")
+                    import traceback
+                    print("Full stack trace for dbdate conversion:")
+                    traceback.print_exc()
                     continue
+    
     if not dfs:
-        print("No concept files could be loaded successfully")
+        print("❌ No concept files could be loaded successfully")
         return None
+    
     print("Concatenating concept data...")
     df_all = pd.concat(dfs, ignore_index=True)
     print(f"Concept table shape: {df_all.shape}")
@@ -150,7 +174,8 @@ def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
     cols = [c for c in keep_cols if c in df_all.columns]
     print(f"Available columns: {cols}")
     if not cols:
-        print("Warning: No expected columns found in concept table")
+        print("❌ Warning: No expected columns found in concept table")
+        print(f"All columns: {list(df_all.columns)}")
         return None
     
     result = df_all[cols].drop_duplicates('concept_id') if 'concept_id' in cols else df_all.drop_duplicates()
@@ -386,22 +411,37 @@ def main():
 
     # Load OMOP concept tables (best-effort)
     print("Loading OMOP concept tables...")
-    concept_df = read_concept_table(omop_dir)
-    rel_df = read_concept_relationship_table(omop_dir)
+    try:
+        concept_df = read_concept_table(omop_dir)
+        if concept_df is None:
+            raise RuntimeError("Failed to load concept table - no data returned")
+    except Exception as e:
+        print(f"❌ Failed to load concept table")
+        print(f"Error: {e}")
+        import traceback
+        print("Full stack trace:")
+        traceback.print_exc()
+        raise RuntimeError("Concept table loading failed - cannot continue without OMOP data")
     
-    if concept_df is not None:
-        print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
-        print(f"   Available columns: {list(concept_df.columns)}")
-        if 'concept_name' in concept_df.columns:
-            print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
-    else:
-        print("❌ Failed to load concept table")
+    try:
+        rel_df = read_concept_relationship_table(omop_dir)
+        if rel_df is None:
+            raise RuntimeError("Failed to load relationship table - no data returned")
+    except Exception as e:
+        print(f"❌ Failed to load relationship table")
+        print(f"Error: {e}")
+        import traceback
+        print("Full stack trace:")
+        traceback.print_exc()
+        raise RuntimeError("Relationship table loading failed - cannot continue without OMOP data")
     
-    if rel_df is not None:
-        print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
-        print(f"   Available columns: {list(rel_df.columns)}")
-    else:
-        print("❌ Failed to load relationship table")
+    print(f"✅ Successfully loaded concept table with {len(concept_df)} concepts")
+    print(f"   Available columns: {list(concept_df.columns)}")
+    if 'concept_name' in concept_df.columns:
+        print(f"   Sample concept names: {concept_df['concept_name'].dropna().head(5).tolist()}")
+    
+    print(f"✅ Successfully loaded relationship table with {len(rel_df)} relationships")
+    print(f"   Available columns: {list(rel_df.columns)}")
 
     # Build table
     table = build_top_table(
