@@ -8,4 +8,4 @@ python test.py \
   --temperature 1.0 \
   --top_k 50 \
   --top_p 0.9 \
-  --patient_limit 10
+  --patient_limit 100

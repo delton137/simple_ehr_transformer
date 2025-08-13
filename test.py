@@ -533,8 +533,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     import argparse
     import pickle
+    import time
     from sklearn.metrics import roc_auc_score
-    from tqdm import tqdm
 
     p = argparse.ArgumentParser(description="Evaluate next-year concept occurrence using tokenized timelines")
     p.add_argument("--model_path", type=str, required=True)
@@ -628,7 +628,9 @@ def main() -> None:
     y_true: Dict[str, List[int]] = {t: [] for t in targets}
 
     per_patient: Dict[int, Dict[str, float]] = {}
-    for i, pid in enumerate(tqdm(overlap, desc="Evaluating patients", unit="pt"), start=1):
+    total = len(overlap)
+    for i, pid in enumerate(overlap, start=1):
+        t0 = time.time()
         hist = current_tt.get(pid, [])
         fut = future_tt.get(pid, [])
         probs = generate_probs(hist)
@@ -637,7 +639,8 @@ def main() -> None:
         for key in targets:
             y_prob[key].append(probs.get(key, 0.0))
             y_true[key].append(labs.get(key, 0))
-        # tqdm handles progress output
+        dt = time.time() - t0
+        print(f"completed patient {i}/{total} time={dt:.2f} seconds")
 
     # AUROC per target
     aurocs: Dict[str, float] = {}
