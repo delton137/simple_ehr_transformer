@@ -14,9 +14,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 from config import model_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataLoader
 from model import create_ethos_model, ETHOSTransformer
@@ -34,7 +31,7 @@ logger = logging.getLogger(__name__)
 class ETHOSTrainer:
     """Trainer class for ETHOS transformer model"""
     
-    def __init__(self, model, train_loader, val_loader, device, config, model_dir: str = "models", train_sampler: Optional[DistributedSampler] = None, rank: int = 0):
+    def __init__(self, model, train_loader, val_loader, device, config, model_dir: str = "models"):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -43,8 +40,6 @@ class ETHOSTrainer:
         self.use_amp: bool = bool(config.get('use_amp', False))
         self.grad_accum_steps: int = int(config.get('grad_accum_steps', 1))
         self.model_dir = model_dir
-        self.train_sampler = train_sampler
-        self.rank = rank
         
         # Training components
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
@@ -76,6 +71,7 @@ class ETHOSTrainer:
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float('inf')
+        self.last_val_loss: Optional[float] = None
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
@@ -96,9 +92,6 @@ class ETHOSTrainer:
     
     def _setup_csv_logging(self):
         """Setup CSV logging for training progress"""
-        if self.rank != 0:
-            return
-        
         # Check if CSV file already exists (for resuming)
         csv_exists = os.path.exists(self.csv_log_path)
         
@@ -108,20 +101,17 @@ class ETHOSTrainer:
             # Create CSV file with headers
             with open(self.csv_log_path, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(['iteration', 'epoch', 'train_loss', 'val_loss', 'learning_rate', 'timestamp'])
+                writer.writerow(['iteration', 'epoch', 'train_loss', 'last_val_loss', 'learning_rate'])
             logger.info(f"Created new CSV file: {self.csv_log_path}")
         
         logger.info(f"CSV logging enabled: {self.csv_log_path}")
     
-    def _log_to_csv(self, iteration: int, epoch: int, train_loss: float, val_loss: float, lr: float):
-        """Log training progress to CSV"""
-        if self.rank != 0:
-            return
-        
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    def _log_to_csv(self, iteration: int, epoch: int, train_loss: float, last_val_loss: Optional[float], lr: float):
+        """Log training progress to CSV (no scientific notation, no timestamp)."""
         with open(self.csv_log_path, 'a', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow([iteration, epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{lr:.2e}", timestamp])
+            last_val_str = "" if last_val_loss is None else f"{last_val_loss:.6f}"
+            writer.writerow([iteration, epoch, f"{train_loss:.6f}", last_val_str, f"{lr:.6f}"])
     
     def train_epoch(self) -> float:
         """Train for one epoch"""
@@ -134,6 +124,11 @@ class ETHOSTrainer:
         # Throughput timing for periodic logs
         last_log_time = time.time()
         last_log_step = 0
+        # Accumulators for step-based CSV logging
+        accum_step_loss: float = 0.0  # sum of losses across the current grad accumulation window
+        loss_since_log: float = 0.0   # sum of optimizer-step losses since last CSV log
+        steps_since_log: int = 0
+
         for batch_idx, (input_ids, target_ids) in enumerate(self.train_loader):
             # Move to device
             input_ids = input_ids.to(self.device, non_blocking=True)
@@ -142,33 +137,29 @@ class ETHOSTrainer:
             # Forward pass
             if (batch_idx % self.grad_accum_steps) == 0:
                 self.optimizer.zero_grad(set_to_none=True)
-            # Avoid gradient synchronization on non-accumulation steps when using DDP
-            from contextlib import nullcontext
-            sync_ctx = nullcontext()
-            if isinstance(self.model, DDP) and (((batch_idx + 1) % self.grad_accum_steps) != 0):
-                sync_ctx = self.model.no_sync()
-
-            with sync_ctx:
-                if self.scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        logits = self.model(input_ids)
-                        batch_size, seq_len, vocab_size = logits.size()
-                        logits = logits.view(-1, vocab_size)
-                        targets = target_ids.view(-1)
-                        loss = self.criterion(logits, targets)
-                        loss = loss / self.grad_accum_steps
-                    self.scaler.scale(loss).backward()
-                else:
+                accum_step_loss = 0.0
+            if self.scaler is not None:
+                with torch.amp.autocast('cuda'):
                     logits = self.model(input_ids)
-                    # Reshape for loss calculation
                     batch_size, seq_len, vocab_size = logits.size()
                     logits = logits.view(-1, vocab_size)
                     targets = target_ids.view(-1)
-                    # Calculate loss
                     loss = self.criterion(logits, targets)
                     loss = loss / self.grad_accum_steps
-                    # Backward pass
-                    loss.backward()
+                self.scaler.scale(loss).backward()
+                accum_step_loss += float(loss.item())
+            else:
+                logits = self.model(input_ids)
+                # Reshape for loss calculation
+                batch_size, seq_len, vocab_size = logits.size()
+                logits = logits.view(-1, vocab_size)
+                targets = target_ids.view(-1)
+                # Calculate loss
+                loss = self.criterion(logits, targets)
+                loss = loss / self.grad_accum_steps
+                # Backward pass
+                loss.backward()
+                accum_step_loss += float(loss.item())
             
             # Step optimizer on accumulation boundary
             if ((batch_idx + 1) % self.grad_accum_steps) == 0 or ((batch_idx + 1) == len(self.train_loader)):
@@ -184,32 +175,24 @@ class ETHOSTrainer:
                 self.scheduler.step()
                 self.global_step += 1
 
+                # Record optimizer-step loss for CSV logging
+                step_loss_value = accum_step_loss  # summed per-batch loss in this accumulation window
+                loss_since_log += step_loss_value
+                steps_since_log += 1
+
                 if self.validate_every_steps > 0 and (self.global_step % self.validate_every_steps == 0):
                     _val_t0 = time.time()
                     val_loss = self.validate_epoch()
                     _val_time = time.time() - _val_t0
 
-                    if dist.is_initialized():
-                        tensor = torch.tensor([val_loss], device=self.device)
-                        dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
-                        val_loss = tensor.item()
-
                     is_best = val_loss < self.best_val_loss
                     if is_best:
                         self.best_val_loss = val_loss
-                    if self.rank == 0:
-                        logger.info(
-                            f"[Step {self.global_step}] Validation Loss: {val_loss:.4f} (best: {self.best_val_loss:.4f}) | "
-                            f"Val Time: {_val_time:.2f}s"
-                        )
-                        # Log to CSV
-                        self._log_to_csv(
-                            iteration=self.global_step,
-                            epoch=self.current_epoch,
-                            train_loss=0.0,  # We don't have epoch train loss yet
-                            val_loss=val_loss,
-                            lr=self.scheduler.get_last_lr()[0]
-                        )
+                    self.last_val_loss = val_loss
+                    logger.info(
+                        f"[Step {self.global_step}] Validation Loss: {val_loss:.4f} (best: {self.best_val_loss:.4f}) | "
+                        f"Val Time: {_val_time:.2f}s"
+                    )
                     # Optionally save best checkpoint at step
                     if is_best:
                         self.save_checkpoint(is_best=True)
@@ -227,8 +210,8 @@ class ETHOSTrainer:
             # Log learning rate
             self.learning_rates.append(self.scheduler.get_last_lr()[0])
 
-            # Periodic logging (no tqdm)
-            if self.rank == 0 and ((batch_idx + 1) % self.log_every == 0):
+            # Periodic console logging by batches (unchanged)
+            if ((batch_idx + 1) % self.log_every == 0):
                 now = time.time()
                 steps_since = (batch_idx + 1) - last_log_step
                 elapsed = max(1e-9, now - last_log_time)
@@ -236,13 +219,26 @@ class ETHOSTrainer:
                 avg_running = running_loss / max(1, running_count)
                 logger.info(
                     f"Epoch {self.current_epoch + 1} | Step {batch_idx + 1}/{len(self.train_loader)} | "
-                    f"Loss: {avg_running:.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | "
+                    f"Loss: {avg_running:.4f} | LR: {self.scheduler.get_last_lr()[0]:.6f} | "
                     f"t/100 iters: {time_per_100:.2f}s"
                 )
                 running_loss = 0.0
                 running_count = 0
                 last_log_time = now
                 last_log_step = batch_idx + 1
+
+            # CSV logging every N optimizer steps
+            if steps_since_log > 0 and (self.global_step % self.log_every == 0):
+                avg_train_since = loss_since_log / float(steps_since_log)
+                self._log_to_csv(
+                    iteration=self.global_step,
+                    epoch=self.current_epoch,
+                    train_loss=avg_train_since,
+                    last_val_loss=self.last_val_loss,
+                    lr=self.scheduler.get_last_lr()[0]
+                )
+                loss_since_log = 0.0
+                steps_since_log = 0
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return avg_loss
@@ -285,8 +281,6 @@ class ETHOSTrainer:
     
     def save_checkpoint(self, is_best: bool = False):
         """Save model checkpoint"""
-        if self.rank != 0:
-            return
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
@@ -310,8 +304,6 @@ class ETHOSTrainer:
 
     def save_step_checkpoint(self, step: int):
         """Save a snapshot checkpoint with step number to allow caching."""
-        if self.rank != 0:
-            return
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
@@ -387,19 +379,13 @@ class ETHOSTrainer:
 #-------------------------------------------------------------------------------------------
     def train(self, resume_from: str = None):
         """Main training loop with automatic checkpoint detection"""
-
-        if self.rank == 0:
-            logger.info("Starting training...")
-        
+        logger.info("Starting training...")
         # Auto-resume from latest checkpoint if available
-        if self.rank == 0:
-            self.auto_resume_from_checkpoint()
+        self.auto_resume_from_checkpoint()
         
         # Training loop
         for epoch in range(self.current_epoch, self.config['max_epochs']):
             self.current_epoch = epoch
-            if self.train_sampler is not None:
-                self.train_sampler.set_epoch(epoch)
             
             # Train
             start_time = time.time()
@@ -411,33 +397,20 @@ class ETHOSTrainer:
             val_loss = self.validate_epoch()
             val_time_epoch = time.time() - _val_t0_epoch
             
-            # Optional: reduce val loss across ranks
-            if dist.is_initialized():
-                tensor = torch.tensor([val_loss], device=self.device)
-                dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
-                val_loss = tensor.item()
-            
             # Update best validation loss
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
             
             # Log metrics
-            if self.rank == 0:
-                logger.info(
-                    f"Epoch {epoch + 1}/{self.config['max_epochs']} - "
-                    f"Train Loss: {train_loss:.4f} - "
-                    f"Val Loss: {val_loss:.4f} - "
-                    f"Time: {train_time:.2f}s - Val Time: {val_time_epoch:.2f}s"
-                )
-                # Log to CSV
-                self._log_to_csv(
-                    iteration=self.global_step,
-                    epoch=epoch + 1,
-                    train_loss=train_loss,
-                    val_loss=val_loss,
-                    lr=self.scheduler.get_last_lr()[0]
-                )
+            logger.info(
+                f"Epoch {epoch + 1}/{self.config['max_epochs']} - "
+                f"Train Loss: {train_loss:.4f} - "
+                f"Val Loss: {val_loss:.4f} - "
+                f"Time: {train_time:.2f}s - Val Time: {val_time_epoch:.2f}s"
+            )
+            # Update last validation loss for reference
+            self.last_val_loss = val_loss
             
             # Store losses
             self.train_losses.append(train_loss)
@@ -446,9 +419,8 @@ class ETHOSTrainer:
             # Save checkpoint
             self.save_checkpoint(is_best=is_best)
             
-        # Final plotting
-        if self.rank == 0:
-            logger.info("Training completed!")
+        # Final message
+        logger.info("Training completed!")
 
 
 def load_processed_data(data_dir: str):
@@ -495,18 +467,6 @@ def main():
 
     # Favor less fragmentation on GPUs
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-    
-    # DDP auto-detection
-    ddp = False
-    local_rank = int(os.environ.get('LOCAL_RANK', -1))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    if local_rank >= 0 and world_size > 1:
-        ddp = True
-        if not dist.is_initialized():
-            from datetime import timedelta
-            dist.init_process_group(backend='nccl', timeout=timedelta(minutes=15))
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    is_rank0 = (rank == 0)
 
     # Handle tag-based data directory
     if args.tag and not args.data_dir.startswith('processed_data_'):
@@ -514,39 +474,33 @@ def main():
     
     # Validate data directory
     if not os.path.exists(args.data_dir):
-        if is_rank0:
-            print(f"❌ Error: Data directory '{args.data_dir}' does not exist!")
-            print(f"Available directories:")
-            available_dirs = [d for d in os.listdir('.') if d.startswith('processed_data')]
-            if available_dirs:
-                for d in available_dirs:
-                    print(f"  - {d}")
-            else:
-                print("  - No processed_data directories found")
-            print(f"\nTo process data with a tag, run:")
-            print(f"  python data_processor.py --tag {args.tag or 'your_tag'}")
+        print(f"❌ Error: Data directory '{args.data_dir}' does not exist!")
+        print(f"Available directories:")
+        available_dirs = [d for d in os.listdir('.') if d.startswith('processed_data')]
+        if available_dirs:
+            for d in available_dirs:
+                print(f"  - {d}")
+        else:
+            print("  - No processed_data directories found")
+        print(f"\nTo process data with a tag, run:")
+        print(f"  python data_processor.py --tag {args.tag or 'your_tag'}")
         return
     
-    if is_rank0:
-        print(f"🚀 Starting ETHOS Transformer Training")
-        print(f"📁 Data directory: {args.data_dir}")
-        if args.tag:
-            print(f"🏷️  Dataset tag: {args.tag}")
-        print(f"⚙️  Batch size (per process): {args.batch_size}")
-        print(f"📈 Max epochs: {args.max_epochs}")
-        print(f"📚 Learning rate: {args.learning_rate}")
+    print(f"🚀 Starting ETHOS Transformer Training")
+    print(f"📁 Data directory: {args.data_dir}")
+    if args.tag:
+        print(f"🏷️  Dataset tag: {args.tag}")
+    print(f"⚙️  Batch size (per process): {args.batch_size}")
+    print(f"📈 Max epochs: {args.max_epochs}")
+    print(f"📚 Learning rate: {args.learning_rate}")
     
     # Set device
     if args.device == 'auto':
-        if torch.cuda.is_available():
-            device = torch.device(f'cuda:{local_rank}' if ddp else 'cuda')
-        else:
-            device = torch.device('cpu')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
-        device = torch.device(f'cuda:{local_rank}' if (args.device == 'cuda' and ddp) else args.device)
+        device = torch.device(args.device)
     
-    if is_rank0:
-        print(f"💻 Device: {device}")
+    print(f"💻 Device: {device}")
     # Enable TF32 for speed/memory on Ampere+ GPUs
     if device.type == 'cuda':
         try:
@@ -560,50 +514,46 @@ def main():
         args.use_amp = True
     
     # Load data
-    if is_rank0:
-        print("\n📊 Loading data...")
+    print("\n📊 Loading data...")
     try:
         tokenized_timelines, vocab = load_processed_data(args.data_dir)
-        if is_rank0:
-            print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
-            print(f"📚 Vocabulary size: {len(vocab)}")
-            # Optionally print a random patient timeline
-            if args.print_random_timeline and tokenized_timelines:
-                import random
-                id_to_token = {v: k for k, v in vocab.items()}
-                # Prefer longer timelines (>100 tokens); fallback to the longest available
-                candidates = [pid for pid, seq in tokenized_timelines.items() if len(seq) > 100]
-                if candidates:
-                    rand_pid = random.choice(candidates)
-                else:
-                    # Fallback: pick the longest timeline
-                    rand_pid = max(tokenized_timelines.keys(), key=lambda pid: len(tokenized_timelines[pid]))
-                seq = tokenized_timelines[rand_pid]
-                decoded = [id_to_token.get(t, f'UNKNOWN_{t}') for t in seq]
-                print("\n🧪 Sample patient timeline (prefer >100 tokens):")
-                print(f"  Patient ID: {rand_pid}")
-                print(f"  Sequence length: {len(seq)}")
-                preview = 200
-                if len(decoded) > preview:
-                    print(f"  Tokens (first {preview}):")
-                    print("   ", decoded[:preview])
-                else:
-                    print("  Tokens:")
-                    print("   ", decoded)
+        print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
+        print(f"📚 Vocabulary size: {len(vocab)}")
+        # Optionally print a random patient timeline
+        if args.print_random_timeline and tokenized_timelines:
+            import random
+            id_to_token = {v: k for k, v in vocab.items()}
+            # Prefer longer timelines (>100 tokens); fallback to the longest available
+            candidates = [pid for pid, seq in tokenized_timelines.items() if len(seq) > 100]
+            if candidates:
+                rand_pid = random.choice(candidates)
+            else:
+                # Fallback: pick the longest timeline
+                rand_pid = max(tokenized_timelines.keys(), key=lambda pid: len(tokenized_timelines[pid]))
+            seq = tokenized_timelines[rand_pid]
+            decoded = [id_to_token.get(t, f'UNKNOWN_{t}') for t in seq]
+            print("\n🧪 Sample patient timeline (prefer >100 tokens):")
+            print(f"  Patient ID: {rand_pid}")
+            print(f"  Sequence length: {len(seq)}")
+            preview = 200
+            if len(decoded) > preview:
+                print(f"  Tokens (first {preview}):")
+                print("   ", decoded[:preview])
+            else:
+                print("  Tokens:")
+                print("   ", decoded)
     except Exception as e:
-        if is_rank0:
-            print(f"❌ Error loading data: {e}")
+        print(f"❌ Error loading data: {e}")
         return
     
     # Create data loaders
-    if is_rank0:
-        print("\n🔧 Creating data loaders...")
+    print("\n🔧 Creating data loaders...")
     try:
         data_processor = PHTDataProcessor(tokenized_timelines, len(vocab), train_split=0.9, seed=42)
         # Respect max_seq_len from args
         train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
         # Optional stats before loader creation
-        if args.print_timeline_stats and is_rank0:
+        if args.print_timeline_stats:
             def _count_bucket(n: int) -> str:
                 if n <= 10:
                     return '0-10'
@@ -628,53 +578,30 @@ def main():
             print("  Training timeline length histogram:")
             for k in ['0-10','10-20','20-100','100-200','200-800','>800']:
                 print(f"    {k}: {buckets[k]}")
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if ddp else None
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if ddp else None
         # Drop last batch in train to avoid uneven last batch across ranks
-        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=(not ddp), num_workers=args.num_workers, sampler=train_sampler, drop_last=True)
-        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, sampler=val_sampler, drop_last=False)
-        if is_rank0:
-            print(f"✅ Training batches: {len(train_loader)}")
-            print(f"✅ Validation batches: {len(val_loader)}")
+        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+        print(f"✅ Training batches: {len(train_loader)}")
+        print(f"✅ Validation batches: {len(val_loader)}")
     except Exception as e:
-        if is_rank0:
-            print(f"❌ Error creating data loaders: {e}")
+        print(f"❌ Error creating data loaders: {e}")
         return
     
     # Create model
-    if is_rank0:
-        print("\n🏗️  Creating model...")
+    print("\n🏗️  Creating model...")
     try:
         model = create_ethos_model(len(vocab))
         model = model.to(device)
-        if ddp:
-            # Use static_graph to reduce collective overhead when graph is fixed
-            model = DDP(
-                model,
-                device_ids=[device.index] if device.type == 'cuda' else None,
-                find_unused_parameters=False,
-                gradient_as_bucket_view=True,
-                static_graph=True,
-            )
-            if is_rank0:
-                print("DDP enabled: static_graph=True, gradient_as_bucket_view=True")
-        elif args.device in ('auto', 'cuda') and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            # Fallback to DataParallel only when not using DDP
-            if is_rank0:
-                print(f"🧮 Using {torch.cuda.device_count()} GPUs via DataParallel")
-            model = torch.nn.DataParallel(model)
-        if is_rank0:
-            try:
-                num_params = model.module.count_parameters() if hasattr(model, 'module') else model.count_parameters()
-                print(f"✅ Model created with {num_params:,} parameters")
-            except Exception:
-                print("✅ Model created")
+        try:
+            num_params = model.count_parameters()  # type: ignore[attr-defined]
+            print(f"✅ Model created with {num_params:,} parameters")
+        except Exception:
+            print("✅ Model created")
     except RuntimeError as e:
         # Handle OOM at model init by retrying with a smaller config
         oom = ('out of memory' in str(e).lower())
         if oom:
-            if is_rank0:
-                print("⚠️ OOM during model creation. Retrying with smaller configuration (d_model=384, n_heads=6, d_ff=1536)...")
+            print("⚠️ OOM during model creation. Retrying with smaller configuration (d_model=384, n_heads=6, d_ff=1536)...")
             try:
                 model = ETHOSTransformer(
                     vocab_size=len(vocab),
@@ -685,46 +612,23 @@ def main():
                     max_seq_len=args.max_seq_len,
                     dropout=model_config.dropout,
                 ).to(device)
-                if ddp:
-                    model = DDP(
-                        model,
-                        device_ids=[device.index] if device.type == 'cuda' else None,
-                        find_unused_parameters=False,
-                        gradient_as_bucket_view=True,
-                        static_graph=True,
-                    )
-                if is_rank0:
-                    try:
-                        num_params = model.module.count_parameters() if hasattr(model, 'module') else model.count_parameters()
-                        print(f"✅ Model created with {num_params:,} parameters (fallback)")
-                    except Exception:
-                        print("✅ Model created (fallback)")
+                try:
+                    num_params = model.count_parameters()  # type: ignore[attr-defined]
+                    print(f"✅ Model created with {num_params:,} parameters (fallback)")
+                except Exception:
+                    print("✅ Model created (fallback)")
             except Exception as ee:
-                if is_rank0:
-                    print(f"❌ Error creating fallback model: {ee}")
-                if ddp and dist.is_initialized():
-                    try:
-                        dist.destroy_process_group()
-                    except Exception:
-                        pass
+                print(f"❌ Error creating fallback model: {ee}")
                 return
         else:
-            if is_rank0:
-                print(f"❌ Error creating model: {e}")
-            if ddp and dist.is_initialized():
-                try:
-                    dist.destroy_process_group()
-                except Exception:
-                    pass
+            print(f"❌ Error creating model: {e}")
             return
     except Exception as e:
-        if is_rank0:
-            print(f"❌ Error creating model: {e}")
+        print(f"❌ Error creating model: {e}")
         return
     
     # Setup training via ETHOSTrainer
-    if is_rank0:
-        print("\n⚙️  Setting up training...")
+    print("\n⚙️  Setting up training...")
     try:
         trainer_config = {
             'learning_rate': args.learning_rate,
@@ -740,22 +644,14 @@ def main():
         # Determine model output directory (tag-aware)
         model_dir = os.path.join('models', args.tag) if args.tag else 'models'
         os.makedirs(model_dir, exist_ok=True)
-        if is_rank0:
-            print(f"💾 Models will be saved to: {model_dir}/")
-        trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config, model_dir=model_dir, train_sampler=train_sampler, rank=rank)
+        print(f"💾 Models will be saved to: {model_dir}/")
+        trainer = ETHOSTrainer(model, train_loader, val_loader, device, trainer_config, model_dir=model_dir)
         trainer.train()
     except Exception as e:
-        if is_rank0:
-            print(f"❌ Training error: {e}")
-            import traceback
-            traceback.print_exc()
+        print(f"❌ Training error: {e}")
+        import traceback
+        traceback.print_exc()
         return
-    finally:
-        if ddp and dist.is_initialized():
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
 
 if __name__ == "__main__":
     main()
