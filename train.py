@@ -19,6 +19,7 @@ import math
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import csv
 
 from config import model_config, data_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataset, PHTDataLoader
@@ -86,11 +87,41 @@ class ETHOSTrainer:
         self.val_losses = []
         self.learning_rates = []
         self.log_every: int = int(config.get('log_every', 200))
+        # Step-based hooks
+        self.validate_every_steps: int = int(config.get('validate_every_steps', 0))
+        self.checkpoint_every_steps: int = int(config.get('checkpoint_every_steps', 0))
+        self.global_step: int = 0  # counts optimizer update steps
+        
+        # CSV logging for training progress
+        self.csv_log_path = os.path.join(self.model_dir, 'training_progress.csv')
+        self._setup_csv_logging()
         
         # Create output directories
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs('logs', exist_ok=True)
         os.makedirs('plots', exist_ok=True)
+    
+    def _setup_csv_logging(self):
+        """Setup CSV logging for training progress"""
+        if self.rank != 0:
+            return
+        
+        # Create CSV file with headers
+        with open(self.csv_log_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['iteration', 'epoch', 'train_loss', 'val_loss', 'learning_rate', 'timestamp'])
+        
+        logger.info(f"CSV logging enabled: {self.csv_log_path}")
+    
+    def _log_to_csv(self, iteration: int, epoch: int, train_loss: float, val_loss: float, lr: float):
+        """Log training progress to CSV"""
+        if self.rank != 0:
+            return
+        
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        with open(self.csv_log_path, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([iteration, epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{lr:.2e}", timestamp])
     
     def train_epoch(self) -> float:
         """Train for one epoch"""
@@ -100,6 +131,9 @@ class ETHOSTrainer:
         
         running_loss = 0.0
         running_count = 0
+        # Throughput timing for periodic logs
+        last_log_time = time.time()
+        last_log_step = 0
         for batch_idx, (input_ids, target_ids) in enumerate(self.train_loader):
             # Move to device
             input_ids = input_ids.to(self.device, non_blocking=True)
@@ -148,6 +182,43 @@ class ETHOSTrainer:
                 else:
                     self.optimizer.step()
                 self.scheduler.step()
+                # Increment global step after each optimizer update
+                self.global_step += 1
+
+                # Step-based validation
+                if self.validate_every_steps > 0 and (self.global_step % self.validate_every_steps == 0):
+                    _val_t0 = time.time()
+                    val_loss = self.validate_epoch()
+                    _val_time = time.time() - _val_t0
+                    # Average across ranks if distributed
+                    if dist.is_initialized():
+                        tensor = torch.tensor([val_loss], device=self.device)
+                        dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+                        val_loss = tensor.item()
+                    # Track best and log
+                    is_best = val_loss < self.best_val_loss
+                    if is_best:
+                        self.best_val_loss = val_loss
+                    if self.rank == 0:
+                        logger.info(
+                            f"[Step {self.global_step}] Validation Loss: {val_loss:.4f} (best: {self.best_val_loss:.4f}) | "
+                            f"Val Time: {_val_time:.2f}s"
+                        )
+                        # Log to CSV
+                        self._log_to_csv(
+                            iteration=self.global_step,
+                            epoch=self.current_epoch,
+                            train_loss=0.0,  # We don't have epoch train loss yet
+                            val_loss=val_loss,
+                            lr=self.scheduler.get_last_lr()[0]
+                        )
+                    # Optionally save best checkpoint at step
+                    if is_best:
+                        self.save_checkpoint(is_best=True)
+
+                # Step-based checkpoint caching (snapshot)
+                if self.checkpoint_every_steps > 0 and (self.global_step % self.checkpoint_every_steps == 0):
+                    self.save_step_checkpoint(self.global_step)
             
             # Update metrics
             step_loss = loss.item() * self.grad_accum_steps
@@ -160,13 +231,20 @@ class ETHOSTrainer:
 
             # Periodic logging (no tqdm)
             if self.rank == 0 and ((batch_idx + 1) % self.log_every == 0):
+                now = time.time()
+                steps_since = (batch_idx + 1) - last_log_step
+                elapsed = max(1e-9, now - last_log_time)
+                time_per_100 = (elapsed / max(1, steps_since)) * 100.0
                 avg_running = running_loss / max(1, running_count)
                 logger.info(
                     f"Epoch {self.current_epoch + 1} | Step {batch_idx + 1}/{len(self.train_loader)} | "
-                    f"Loss: {avg_running:.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e}"
+                    f"Loss: {avg_running:.4f} | LR: {self.scheduler.get_last_lr()[0]:.2e} | "
+                    f"t/100 iters: {time_per_100:.2f}s"
                 )
                 running_loss = 0.0
                 running_count = 0
+                last_log_time = now
+                last_log_step = batch_idx + 1
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         return avg_loss
@@ -213,6 +291,7 @@ class ETHOSTrainer:
             return
         checkpoint = {
             'epoch': self.current_epoch,
+            'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -230,6 +309,26 @@ class ETHOSTrainer:
         if is_best:
             torch.save(checkpoint, os.path.join(self.model_dir, 'best_checkpoint.pth'))
             logger.info(f"Saved best checkpoint with validation loss: {self.best_val_loss:.4f}")
+
+    def save_step_checkpoint(self, step: int):
+        """Save a snapshot checkpoint with step number to allow caching."""
+        if self.rank != 0:
+            return
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'learning_rates': self.learning_rates,
+            'config': self.config
+        }
+        filename = os.path.join(self.model_dir, f'checkpoint_step_{step:07d}.pth')
+        torch.save(checkpoint, filename)
+        logger.info(f"Saved step checkpoint: {filename}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
@@ -240,6 +339,7 @@ class ETHOSTrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         self.current_epoch = checkpoint['epoch']
+        self.global_step = int(checkpoint.get('global_step', 0))
         self.best_val_loss = checkpoint['best_val_loss']
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
@@ -297,7 +397,9 @@ class ETHOSTrainer:
             train_time = time.time() - start_time
             
             # Validate (only on rank 0 to save time, or on all ranks and average)
+            _val_t0_epoch = time.time()
             val_loss = self.validate_epoch()
+            val_time_epoch = time.time() - _val_t0_epoch
             
             # Optional: reduce val loss across ranks
             if dist.is_initialized():
@@ -316,7 +418,15 @@ class ETHOSTrainer:
                     f"Epoch {epoch + 1}/{self.config['max_epochs']} - "
                     f"Train Loss: {train_loss:.4f} - "
                     f"Val Loss: {val_loss:.4f} - "
-                    f"Time: {train_time:.2f}s"
+                    f"Time: {train_time:.2f}s - Val Time: {val_time_epoch:.2f}s"
+                )
+                # Log to CSV
+                self._log_to_csv(
+                    iteration=self.global_step,
+                    epoch=epoch + 1,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    lr=self.scheduler.get_last_lr()[0]
                 )
             
             # Store losses
@@ -370,6 +480,8 @@ def main():
     parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
     parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
+    parser.add_argument('--validate_every_steps', type=int, default=4000, help='Run validation every N optimizer steps (default: 4000). Set 0 to disable step-based validation.')
+    parser.add_argument('--checkpoint_every_steps', type=int, default=20000, help='Save a snapshot checkpoint every N optimizer steps (default: 20000). Set 0 to disable step snapshots.')
     parser.add_argument('--print_timeline_stats', action='store_true',
                        help='Print train/val patient counts and training timeline length histogram before training')
     parser.add_argument('--print_random_timeline', action='store_true',
@@ -617,6 +729,9 @@ def main():
             'use_amp': args.use_amp,
             'grad_accum_steps': args.grad_accum_steps,
             'warmup_steps': args.warmup_steps,
+            'log_every': args.log_every,
+            'validate_every_steps': args.validate_every_steps,
+            'checkpoint_every_steps': args.checkpoint_every_steps,
         }
         # Determine model output directory (tag-aware)
         model_dir = os.path.join('models', args.tag) if args.tag else 'models'

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""
+Analyze the most common tokens and map them to human-readable OMOP concepts.
+
+Outputs a table with columns:
+- token: token string (e.g., MEASUREMENT_3004249)
+- token_id: integer id from vocabulary
+- raw_count: number of occurrences in tokenized timelines
+- frequency_percent: percentage of total counted tokens
+- interpretation: human-readable name (concept_name or derived label)
+- concept_id: OMOP concept_id if applicable
+- domain_id, vocabulary_id, concept_code: extra OMOP metadata when available
+
+Notes:
+- By default, focuses on concept tokens: CONDITION_, DRUG_, PROCEDURE_, MEASUREMENT_, OBSERVATION_, UNIT_
+- Can include non-concept tokens with --include_misc
+"""
+
+import os
+import argparse
+import pickle
+from typing import Dict, List, Tuple, Optional
+from collections import Counter
+
+import pandas as pd
+
+from config import data_config
+
+
+CONCEPT_PREFIXES = (
+    "CONDITION_",
+    "DRUG_",
+    "PROCEDURE_",
+    "MEASUREMENT_",
+    "OBSERVATION_",
+    "UNIT_",
+)
+
+
+def load_processed_data(data_dir: str) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
+    with open(os.path.join(data_dir, 'tokenized_timelines.pkl'), 'rb') as f:
+        tokenized_timelines = pickle.load(f)
+    with open(os.path.join(data_dir, 'vocabulary.pkl'), 'rb') as f:
+        vocab = pickle.load(f)
+    return tokenized_timelines, vocab
+
+
+def invert_vocab(vocab: Dict[str, int]) -> Dict[int, str]:
+    return {v: k for k, v in vocab.items()}
+
+
+def count_token_frequencies(tokenized_timelines: Dict[int, List[int]]) -> Counter:
+    counts: Counter = Counter()
+    for tokens in tokenized_timelines.values():
+        counts.update(tokens)
+    return counts
+
+
+def parse_token(token_str: str) -> Tuple[Optional[str], Optional[int]]:
+    """Return (prefix_without_trailing_, concept_id) if token encodes an OMOP concept, else (None, None)."""
+    for prefix in CONCEPT_PREFIXES:
+        if token_str.startswith(prefix):
+            suffix = token_str[len(prefix):]
+            try:
+                cid = int(suffix)
+            except Exception:
+                return None, None
+            # Normalize prefix label without trailing underscore
+            return prefix[:-1], cid
+    return None, None
+
+
+def read_concept_table(omop_dir: str) -> Optional[pd.DataFrame]:
+    concept_dir = os.path.join(omop_dir, 'concept')
+    if not os.path.isdir(concept_dir):
+        return None
+    files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
+    if not files:
+        return None
+    dfs: List[pd.DataFrame] = []
+    for fp in files:
+        try:
+            df = pd.read_parquet(fp, engine='pyarrow')
+            dfs.append(df)
+        except Exception:
+            try:
+                df = pd.read_parquet(fp, engine='fastparquet')
+                dfs.append(df)
+            except Exception:
+                continue
+    if not dfs:
+        return None
+    df_all = pd.concat(dfs, ignore_index=True)
+    # Keep relevant columns if present
+    keep_cols = [
+        'concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code',
+        'standard_concept'
+    ]
+    cols = [c for c in keep_cols if c in df_all.columns]
+    return df_all[cols].drop_duplicates('concept_id') if cols else df_all.drop_duplicates('concept_id')
+
+
+def read_concept_relationship_table(omop_dir: str) -> Optional[pd.DataFrame]:
+    rel_dir = os.path.join(omop_dir, 'concept_relationship')
+    if not os.path.isdir(rel_dir):
+        return None
+    files = [os.path.join(rel_dir, f) for f in os.listdir(rel_dir) if f.endswith('.parquet')]
+    if not files:
+        return None
+    dfs: List[pd.DataFrame] = []
+    for fp in files:
+        try:
+            df = pd.read_parquet(fp, engine='pyarrow')
+            dfs.append(df)
+        except Exception:
+            try:
+                df = pd.read_parquet(fp, engine='fastparquet')
+                dfs.append(df)
+            except Exception:
+                continue
+    if not dfs:
+        return None
+    df_all = pd.concat(dfs, ignore_index=True)
+    # Normalize column names
+    expected = {'concept_id_1', 'concept_id_2', 'relationship_id'}
+    if not expected.issubset(set(df_all.columns)):
+        return None
+    return df_all[['concept_id_1', 'concept_id_2', 'relationship_id']]
+
+
+def map_to_standard_concept(concept_ids: List[int], concept_df: Optional[pd.DataFrame], rel_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    ci_df = pd.DataFrame({'concept_id': concept_ids}).drop_duplicates()
+    if rel_df is not None:
+        maps_to = rel_df[rel_df['relationship_id'] == 'Maps to'][['concept_id_1', 'concept_id_2']].drop_duplicates()
+        ci_df = ci_df.merge(maps_to, how='left', left_on='concept_id', right_on='concept_id_1')
+        ci_df['standard_id'] = ci_df['concept_id_2'].fillna(ci_df['concept_id'])
+        ci_df = ci_df.drop(columns=['concept_id_1', 'concept_id_2'])
+    else:
+        ci_df['standard_id'] = ci_df['concept_id']
+    if concept_df is not None:
+        concept_cols = ['concept_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']
+        # Join on standard_id for final interpretation
+        ci_df = ci_df.merge(concept_df.rename(columns={'concept_id': 'standard_id'}), how='left', on='standard_id')
+        # For completeness, also provide original concept metadata if different
+        base_meta_cols = [c for c in concept_cols if c in concept_df.columns]
+        if base_meta_cols:
+            ci_df = ci_df.merge(concept_df[base_meta_cols].rename(columns={c: f'orig_{c}' for c in base_meta_cols}),
+                                how='left', left_on='concept_id', right_on=f'orig_concept_id')
+    return ci_df
+
+
+def build_top_table(
+    counts: Counter,
+    id_to_token: Dict[int, str],
+    concept_df: Optional[pd.DataFrame],
+    rel_df: Optional[pd.DataFrame],
+    top_k: int,
+    concept_only: bool,
+) -> pd.DataFrame:
+    # Build list of (token_id, token_str, count)
+    rows: List[Tuple[int, str, int]] = []
+    for tid, cnt in counts.items():
+        token_str = id_to_token.get(tid)
+        if token_str is None:
+            continue
+        if concept_only and not token_str.startswith(CONCEPT_PREFIXES):
+            continue
+        rows.append((tid, token_str, cnt))
+    if not rows:
+        return pd.DataFrame(columns=['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation', 'concept_id', 'domain_id', 'vocabulary_id', 'concept_code'])
+
+    df = pd.DataFrame(rows, columns=['token_id', 'token', 'raw_count'])
+    df = df.sort_values('raw_count', ascending=False)
+    total = df['raw_count'].sum()
+    df['frequency_percent'] = (df['raw_count'] / max(1, total)) * 100.0
+
+    # Extract OMOP concept ids when applicable
+    parsed = df['token'].apply(parse_token)
+    df['prefix'] = parsed.apply(lambda x: x[0])
+    df['concept_id'] = parsed.apply(lambda x: x[1])
+
+    # Map concept ids to standard concepts and names
+    has_concepts = df['concept_id'].notna()
+    if has_concepts.any():
+        concept_ids = df.loc[has_concepts, 'concept_id'].astype(int).tolist()
+        mapped = map_to_standard_concept(concept_ids, concept_df, rel_df)
+        # Merge back on concept_id
+        df = df.merge(mapped[['concept_id', 'standard_id', 'concept_name', 'domain_id', 'vocabulary_id', 'concept_code']],
+                      how='left', on='concept_id')
+        # Interpretation preference: concept_name if present
+        df['interpretation'] = df['concept_name']
+    else:
+        df['interpretation'] = None
+
+    # For tokens without OMOP concept, provide a readable interpretation
+    missing_interp = df['interpretation'].isna()
+    if missing_interp.any():
+        def fallback_interp(tok: str) -> str:
+            if tok.startswith('AGE_'):
+                return f"Age interval {tok[len('AGE_') : ]} years"
+            if tok.startswith('TIME_'):
+                return f"Time gap {tok[len('TIME_') : ]}"
+            if tok.startswith('EVENT_'):
+                return tok[len('EVENT_') : ].capitalize()
+            if tok.startswith('GENDER_'):
+                return f"Gender concept {tok[len('GENDER_') : ]}"
+            if tok.startswith('RACE_'):
+                return f"Race concept {tok[len('RACE_') : ]}"
+            if tok.startswith('YEAR_'):
+                return f"Birth year interval {tok[len('YEAR_') : ]}"
+            if tok.startswith('Q') and tok[1:].isdigit():
+                return f"Quantile token {tok}"
+            if tok in ('<PAD>', '<UNK>', '<EOS>', '<SOS>'):
+                return tok
+            return tok
+
+        df.loc[missing_interp, 'interpretation'] = df.loc[missing_interp, 'token'].apply(fallback_interp)
+
+    # Final sort and trim to top_k
+    df = df[['token', 'token_id', 'raw_count', 'frequency_percent', 'interpretation', 'concept_id', 'domain_id', 'vocabulary_id', 'concept_code']]
+    df = df.sort_values('raw_count', ascending=False).head(top_k).reset_index(drop=True)
+    return df
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Find the most common tokens and map to OMOP concepts')
+    parser.add_argument('--data_dir', type=str, default=None, help='Processed data directory (default: processed_data or processed_data_{tag})')
+    parser.add_argument('--tag', type=str, default=None, help='Dataset tag to locate processed_data_{tag}')
+    parser.add_argument('--omop_dir', type=str, default=None, help='OMOP data directory containing concept/ and concept_relationship/')
+    parser.add_argument('--top_k', type=int, default=100, help='Number of top tokens to report (default: 100)')
+    parser.add_argument('--include_misc', action='store_true', help='Include non-concept tokens (EVENT_/AGE_/TIME_/etc.)')
+    parser.add_argument('--output_csv', type=str, default=None, help='Path to save CSV (default: {data_dir}/top_tokens.csv)')
+
+    args = parser.parse_args()
+
+    # Resolve data_dir
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = f"processed_data_{args.tag}" if args.tag else 'processed_data'
+
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"Processed data directory not found: {data_dir}")
+
+    # Resolve omop_dir
+    omop_dir = args.omop_dir or data_config.omop_data_dir
+
+    # Load processed data
+    tokenized_timelines, vocab = load_processed_data(data_dir)
+    id_to_token = invert_vocab(vocab)
+    counts = count_token_frequencies(tokenized_timelines)
+
+    # Load OMOP concept tables (best-effort)
+    concept_df = read_concept_table(omop_dir)
+    rel_df = read_concept_relationship_table(omop_dir)
+
+    # Build table
+    table = build_top_table(
+        counts=counts,
+        id_to_token=id_to_token,
+        concept_df=concept_df,
+        rel_df=rel_df,
+        top_k=args.top_k,
+        concept_only=(not args.include_misc),
+    )
+
+    # Output CSV
+    out_csv = args.output_csv or os.path.join(data_dir, 'top_tokens.csv')
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    table.to_csv(out_csv, index=False)
+
+    # Print a brief preview
+    print(f"Saved top {len(table)} tokens to {out_csv}")
+    try:
+        preview = table.head(min(20, len(table)))
+        with pd.option_context('display.max_colwidth', 80):
+            print(preview)
+    except Exception:
+        pass
+
+
+if __name__ == '__main__':
+    main()
+
+
