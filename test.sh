@@ -1,7 +1,7 @@
 python test.py \
   --model_path models/aou_pre2023_30000/best_checkpoint.pth \
-  --current_data_dir processed_data_aou_pre2023 \
-  --future_data_dir processed_data_aou_2023 \
+  --current_data_dir processed_data_aou_pre2023_v30000 \
+  --future_data_dir processed_data_aou_2023_v30000 \
   --output_dir test_results_pre_to_2023 \
   --num_samples 20 \
   --max_gen_tokens 256 \
