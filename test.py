@@ -143,6 +143,11 @@ class FutureTester:
         with open(os.path.join(current_data_dir, "patient_timelines.pkl"), "rb") as f:
             import pickle
             self.current_timelines: Dict[int, List[Dict]] = pickle.load(f)
+        # Normalize patient ID key types to int
+        try:
+            self.current_timelines = {int(k): v for k, v in self.current_timelines.items()}
+        except Exception:
+            pass
 
         # Optional: future ground-truth timelines
         self.future_timelines: Optional[Dict[int, List[Dict]]] = None
@@ -152,6 +157,23 @@ class FutureTester:
                 with open(fut_path, "rb") as f:
                     import pickle
                     self.future_timelines = pickle.load(f)
+                # Normalize patient ID key types to int
+                try:
+                    self.future_timelines = {int(k): v for k, v in self.future_timelines.items()}  # type: ignore[dict-item]
+                except Exception:
+                    pass
+        
+        # Quick diagnostics if a future dataset exists
+        if self.future_timelines is not None:
+            cur_ids = set(self.current_timelines.keys())
+            fut_ids = set(self.future_timelines.keys())
+            overlap = len(cur_ids & fut_ids)
+            if overlap == 0:
+                print(
+                    f"Warning: 0 overlapping patients. Current={len(cur_ids)}, Future={len(fut_ids)}. "
+                    f"ID type examples: current={type(next(iter(cur_ids))).__name__ if cur_ids else 'NA'}, "
+                    f"future={type(next(iter(fut_ids))).__name__ if fut_ids else 'NA'}"
+                )
 
         # Load model and adapt checkpoint to current vocab size if needed
         self.model = create_ethos_model(len(self.vocab))
