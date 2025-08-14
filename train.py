@@ -84,20 +84,18 @@ class ETHOSTrainer:
         self.csv_log_path = os.path.join(self.model_dir, 'training_progress.csv')
         self._setup_csv_logging()
         
-        # Create output directories
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs('logs', exist_ok=True)
         os.makedirs('plots', exist_ok=True)
     
     def _setup_csv_logging(self):
         """Setup CSV logging for training progress"""
-        # Check if CSV file already exists (for resuming)
+
         csv_exists = os.path.exists(self.csv_log_path)
         
         if csv_exists:
             logger.info(f"CSV file exists, will append to: {self.csv_log_path}")
         else:
-            # Create CSV file with headers
             with open(self.csv_log_path, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(['iteration', 'epoch', 'train_loss', 'last_val_loss', 'learning_rate'])

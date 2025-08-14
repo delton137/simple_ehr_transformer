@@ -9,8 +9,11 @@ python test.py \
   --temperature 1.0 \
   --top_k 50 \
   --top_p 0.9 \
-  --patient_limit 20 \
-  --targets CONDITION_201826,CONDITION_444070,CONDITION_316139
+  --patient_limit 30 \
+  --targets CONDITION_201826
+  
+  
+  #,CONDITION_444070,CONDITION_316139
 
 
 #ITION_201826 diabetes t2d   "CONDITION_444070",	#fatigue  "CONDITION_316139", #heart failure

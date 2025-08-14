@@ -598,8 +598,22 @@ def main() -> None:
                     do_sample=True,
                 )
             cont = out[0, input_ids.size(1):].tolist()
-            names = [id_to_token.get(tid, "") for tid in cont]
-            name_set = set(names)
+            # Limit evaluation to 1-year horizon using TIME_* deltas
+            minutes = 0
+            horizon = 365 * 24 * 60
+            names_in_horizon: list[str] = []
+            for tid in cont:
+                nm = id_to_token.get(tid, "")
+                if nm.startswith("TIME_"):
+                    label = nm.split("TIME_")[-1]
+                    delta = TIME_LABEL_TO_MINUTES.get(label)
+                    if delta is not None:
+                        minutes += delta
+                    if minutes >= horizon:
+                        break
+                    continue
+                names_in_horizon.append(nm)
+            name_set = set(names_in_horizon)
             for key, vars_set in target_variants.items():
                 if any(v in name_set for v in vars_set):
                     count_present[key] += 1
@@ -608,11 +622,35 @@ def main() -> None:
         return probs
 
     # Prepare labels from future tokenized timelines (presence in the year)
+    STRUCT_PREFIXES = ("AGE_", "GENDER_", "RACE_", "YEAR_")
     def label_from_future(seq: List[int]) -> Dict[str, int]:
-        names = {id_to_token_future.get(tid, "") for tid in seq}
-        lab: Dict[str, int] = {}
-        for key, vars_set in target_variants.items():
-            lab[key] = 1 if any(v in names for v in vars_set) else 0
+        # Time-bounded presence within 1 year, skipping leading structural tokens
+        horizon = 365 * 24 * 60
+        minutes = 0
+        started = False
+        lab: Dict[str, int] = {k: 0 for k in target_variants.keys()}
+        remaining = set(target_variants.keys())
+        for tid in seq:
+            name = id_to_token_future.get(tid, "")
+            if not started:
+                if not name or name.startswith(STRUCT_PREFIXES):
+                    continue
+                started = True
+            if name.startswith("TIME_"):
+                label = name.split("TIME_")[-1]
+                delta = TIME_LABEL_TO_MINUTES.get(label)
+                if delta is not None:
+                    minutes += delta
+                if minutes > horizon:
+                    break
+                continue
+            # Check targets
+            if remaining:
+                for key in list(remaining):
+                    if name in target_variants[key]:
+                        lab[key] = 1
+                        remaining.discard(key)
+                        break
         return lab
 
     y_prob: Dict[str, List[float]] = {t: [] for t in targets}
@@ -621,9 +659,9 @@ def main() -> None:
     # Balanced sampling across multiple conditions: for each target, sample ~N//Y//2 positives and ~N//Y//2 negatives
     import random
     def has_future_token(pid: int, token_key: str) -> bool:
-        seq = future_tt.get(pid, [])
-        names = {id_to_token_future.get(tid, "") for tid in seq}
-        return any(v in names for v in target_variants[token_key])
+        # Use time-bounded labeling logic for balancing as well
+        labs = label_from_future(future_tt.get(pid, []))
+        return labs.get(token_key, 0) == 1
 
     if args.patient_limit is not None and len(overlap) > args.patient_limit:
         want = args.patient_limit
@@ -681,7 +719,12 @@ def main() -> None:
                 gen_names = [id_to_token.get(tid, "") for tid in cont[:args.debug_tokens]]
             except Exception:
                 pass
-            fut_names = decode_seq(fut[:args.debug_tokens], id_to_token_future)
+            # Future preview without leading structural tokens
+            fut_names_raw = decode_seq(fut, id_to_token_future)
+            j = 0
+            while j < len(fut_names_raw) and fut_names_raw[j].startswith(STRUCT_PREFIXES):
+                j += 1
+            fut_names = fut_names_raw[j:j + args.debug_tokens]
             print(f"=== DEBUG patient {pid} ===")
             print(f"history_tail ({len(hist)} total): {hist_names}")
             print(f"generated_preview: {gen_names}")
