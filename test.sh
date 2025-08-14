@@ -1,5 +1,5 @@
 python test.py \
-  --debug_samples 2
+  --debug_samples 2 \
   --model_path models/aou_pre2023_30000/best_checkpoint.pth \
   --current_data_dir processed_data_aou_pre2023_30000 \
   --future_data_dir processed_data_aou_2023_30000 \
