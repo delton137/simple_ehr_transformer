@@ -522,6 +522,7 @@ def main() -> None:
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
+    p.add_argument("--targets", type=str, required=True)
     args = p.parse_args()
 
     # Load current vocab and tokenized timelines
