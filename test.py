@@ -244,7 +244,6 @@ class FutureTester:
         os.makedirs(self.output_dir, exist_ok=True)
 
 
-
     def _truth_occurrence_for_targets(self, current_events: List[Dict], future_events: List[Dict]) -> Dict[str, int]:
         """Return a map canonical_token -> 0/1 indicating any occurrence in the horizon."""
         index_time = self.last_event_time(current_events)
