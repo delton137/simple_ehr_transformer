@@ -6,7 +6,7 @@ python train.py \
     --data_dir $DATA_DIR \
     --batch_size 8 \
     --max_seq_len 512 \
-    --max_epochs 2
+    --max_epochs 3
 
 python test.py \
   --model_path models/aou_pre2023_30000/best_checkpoint.pth \
