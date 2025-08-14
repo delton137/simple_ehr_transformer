@@ -522,6 +522,8 @@ def main() -> None:
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
     p.add_argument("--targets", type=str, required=True)
+    p.add_argument("--debug_samples", type=int, default=0, help="Print detailed debug for first N patients")
+    p.add_argument("--debug_tokens", type=int, default=50, help="How many tokens to print for history/generated samples in debug")
     args = p.parse_args()
 
     # Load current vocab and tokenized timelines
@@ -533,6 +535,10 @@ def main() -> None:
     # Load future tokenized timelines
     with open(os.path.join(args.future_data_dir, "tokenized_timelines.pkl"), "rb") as f:
         future_tt: Dict[int, List[int]] = pickle.load(f)
+    # Load future vocabulary for correct decoding of future IDs
+    with open(os.path.join(args.future_data_dir, "vocabulary.pkl"), "rb") as f:
+        future_vocab: Dict[str, int] = pickle.load(f)
+    id_to_token_future = {tid: name for name, tid in future_vocab.items()}
 
     # Overlap of patient IDs
     cur_ids = set(current_tt.keys())
@@ -603,7 +609,7 @@ def main() -> None:
 
     # Prepare labels from future tokenized timelines (presence in the year)
     def label_from_future(seq: List[int]) -> Dict[str, int]:
-        names = {id_to_token.get(tid, "") for tid in seq}
+        names = {id_to_token_future.get(tid, "") for tid in seq}
         lab: Dict[str, int] = {}
         for key, vars_set in target_variants.items():
             lab[key] = 1 if any(v in names for v in vars_set) else 0
@@ -616,7 +622,7 @@ def main() -> None:
     import random
     def has_future_token(pid: int, token_key: str) -> bool:
         seq = future_tt.get(pid, [])
-        names = {id_to_token.get(tid, "") for tid in seq}
+        names = {id_to_token_future.get(tid, "") for tid in seq}
         return any(v in names for v in target_variants[token_key])
 
     if args.patient_limit is not None and len(overlap) > args.patient_limit:
@@ -653,6 +659,34 @@ def main() -> None:
         for key in targets:
             y_prob[key].append(probs.get(key, 0.0))
             y_true[key].append(labs.get(key, 0))
+        # Optional debug printing
+        if args.debug_samples and i <= args.debug_samples:
+            def decode_seq(ids: List[int], mapper: Dict[int, str]) -> List[str]:
+                return [mapper.get(tid, "") for tid in ids]
+            hist_names = decode_seq(hist[-args.debug_tokens:], id_to_token)
+            # Single-sample generation preview
+            gen_names: List[str] = []
+            try:
+                with torch.no_grad():
+                    inp = torch.tensor([hist[-args.max_input_len:]], dtype=torch.long, device=device)
+                    out = model.generate(
+                        inp,
+                        max_length=len(hist[-args.max_input_len:]) + args.max_gen_tokens,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        do_sample=True,
+                    )
+                cont = out[0, inp.size(1):].tolist()
+                gen_names = [id_to_token.get(tid, "") for tid in cont[:args.debug_tokens]]
+            except Exception:
+                pass
+            fut_names = decode_seq(fut[:args.debug_tokens], id_to_token_future)
+            print(f"=== DEBUG patient {pid} ===")
+            print(f"history_tail ({len(hist)} total): {hist_names}")
+            print(f"generated_preview: {gen_names}")
+            print(f"future_preview: {fut_names}")
+            print(f"labels: {labs}")
         dt = time.time() - t0
         print(f"completed patient {i}/{total} time={dt:.2f} seconds")
 
