@@ -489,7 +489,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_path", type=str, required=True, help="Path to trained model checkpoint")
     p.add_argument("--current_data_dir", type=str, default="processed_data", help="Processed data dir for current patients (e.g., pre_2023)")
     p.add_argument("--future_data_dir", type=str, default=None, help="Processed data dir for future OMOP (e.g., 2023) for ground truth")
-    p.add_argument("--output_dir", type=str, default="test_results", help="Output directory for simulations and metrics")
+    p.add_argument("--output_dir", type=str, default=None, help="Output directory; if not set, uses the directory of --model_path")
     p.add_argument("--device", type=str, default="auto", help="cpu, cuda, or auto")
     p.add_argument("--forward_horizon_days", type=int, default=365)
     p.add_argument("--num_samples", type=int, default=50)
@@ -507,13 +507,15 @@ def main() -> None:
     import argparse
     import pickle
     import time
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import roc_auc_score, roc_curve, auc
+    import matplotlib.pyplot as plt
+    plt.switch_backend('Agg')
 
     p = argparse.ArgumentParser(description="Evaluate next-year concept occurrence using tokenized timelines")
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--current_data_dir", type=str, required=True, help="Processed data dir for current year (e.g., pre_2023)")
     p.add_argument("--future_data_dir", type=str, required=True, help="Processed data dir for next year (e.g., 2023)")
-    p.add_argument("--output_dir", type=str, default="test_results")
+    p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--device", type=str, default="auto", help="cpu, cuda, or auto")
     p.add_argument("--num_samples", type=int, default=20)
     p.add_argument("--max_input_len", type=int, default=512)
@@ -525,6 +527,10 @@ def main() -> None:
     p.add_argument("--debug_samples", type=int, default=0, help="Print detailed debug for first N patients")
     p.add_argument("--debug_tokens", type=int, default=50, help="How many tokens to print for history/generated samples in debug")
     args = p.parse_args()
+
+    # Resolve default output_dir if not provided
+    if not args.output_dir:
+        args.output_dir = os.path.dirname(args.model_path) or "."
 
     # Load current vocab and tokenized timelines
     with open(os.path.join(args.current_data_dir, "vocabulary.pkl"), "rb") as f:
@@ -704,6 +710,15 @@ def main() -> None:
 
     per_patient: Dict[int, Dict[str, float]] = {}
     total = len(selected)
+    # Report target prevalence in the selected test set (time-bounded labels)
+    counts_in_test: Dict[str, int] = {t: 0 for t in targets}
+    for pid in selected:
+        labs = label_from_future(future_tt.get(pid, []))
+        for t in targets:
+            counts_in_test[t] += int(labs.get(t, 0))
+    print("Target prevalence in test set:")
+    for t in targets:
+        print(f"  {t}: {counts_in_test[t]} / {total}")
     print(f"Evaluating on {total} patients (balanced across {len(targets)} conditions where possible)")
     for i, pid in enumerate(selected, start=1):
         t0 = time.time()
@@ -754,6 +769,28 @@ def main() -> None:
         json.dump(per_patient, f, indent=2)
     with open(os.path.join(args.output_dir, "auroc_per_token.json"), "w") as f:
         json.dump(aurocs, f, indent=2)
+
+    # Plot ROC curves per target
+    def _safe_name(s: str) -> str:
+        return ''.join(c if c.isalnum() or c in ('-', '_', '.') else '_' for c in s)
+    for key in targets:
+        y = y_true[key]
+        p = y_prob[key]
+        if not y or (sum(y) == 0 or sum(y) == len(y)):
+            continue
+        fpr, tpr, _ = roc_curve(y, p)
+        auc_val = auc(fpr, tpr)
+        plt.figure(figsize=(5, 5))
+        plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
+        plt.plot(fpr, tpr, label=f"AUC={auc_val:.3f}", linewidth=2)
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC: {key}')
+        plt.legend(loc='lower right')
+        plt.tight_layout()
+        out_path = os.path.join(args.output_dir, f"roc_{_safe_name(key)}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
 
     print("AUROC per token:")
     for k, v in aurocs.items():
