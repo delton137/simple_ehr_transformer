@@ -5,10 +5,9 @@ python test.py \
   --future_data_dir processed_data_aou_2023_30000 \
   --output_dir test_results_pre_to_2023 \
   --num_samples 10 \
-  --max_gen_tokens 2048\
+  --max_gen_tokens 50000 \
   --temperature 1.0 \
   --top_k 50 \
-  --top_p 0.9 \
   --patient_limit 30 \
   --targets CONDITION_201826
   

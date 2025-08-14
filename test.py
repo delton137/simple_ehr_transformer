@@ -20,6 +20,7 @@ import argparse
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
+import torch.nn.functional as F
 from datetime import datetime, timedelta
 from model import create_ethos_model
 from sklearn.metrics import roc_auc_score
@@ -519,7 +520,6 @@ def main() -> None:
     p.add_argument("--max_gen_tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=50)
-    p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
     p.add_argument("--targets", type=str, required=True)
     p.add_argument("--debug_samples", type=int, default=0, help="Print detailed debug for first N patients")
@@ -581,38 +581,56 @@ def main() -> None:
     for t in targets:
         target_variants[t] = expand_variants(t)
 
-    def generate_probs(history_ids: List[int]) -> Dict[str, float]:
-        probs: Dict[str, float] = {t: 0.0 for t in targets}
+    def _sample_next_token(logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+        """Apply temperature, top-k and top-p (nucleus) sampling and return next token ids (batch x 1)."""
+        next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
+        if top_k > 0:
+            top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+            filtered = torch.full_like(next_token_logits, -float('inf'))
+            filtered.scatter_(1, top_k_indices, top_k_logits)
+            next_token_logits = filtered
+        probs = F.softmax(next_token_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _generate_until_horizon(history_ids: List[int]) -> List[int]:
+        """Autoregressively generate up to max_gen_tokens or 1-year via TIME_* tokens."""
         if not history_ids:
-            return probs
-        input_ids = torch.tensor([history_ids[-args.max_input_len:]], dtype=torch.long, device=device)
-        count_present: Dict[str, int] = {t: 0 for t in targets}
-        for _ in range(args.num_samples):
-            with torch.no_grad():
-                out = model.generate(
-                    input_ids,
-                    max_length=history_ids[-args.max_input_len:].__len__() + args.max_gen_tokens,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    do_sample=True,
-                )
-            cont = out[0, input_ids.size(1):].tolist()
-            # Limit evaluation to 1-year horizon using TIME_* deltas
-            minutes = 0
-            horizon = 365 * 24 * 60
-            names_in_horizon: list[str] = []
-            for tid in cont:
-                nm = id_to_token.get(tid, "")
-                if nm.startswith("TIME_"):
-                    label = nm.split("TIME_")[-1]
+            return []
+        # Seed with tail of history
+        current_ids = torch.tensor([history_ids[-args.max_input_len:]], dtype=torch.long, device=device)
+        generated: List[int] = []
+        minutes = 0
+        horizon = 365 * 24 * 60
+        with torch.no_grad():
+            for _ in range(args.max_gen_tokens):
+                logits = model(current_ids)
+                next_token = _sample_next_token(logits, args.temperature, args.top_k)
+                tid = int(next_token.item())
+                generated.append(tid)
+                # Update horizon
+                name = id_to_token.get(tid, "")
+                if name.startswith("TIME_"):
+                    label = name.split("TIME_")[-1]
                     delta = TIME_LABEL_TO_MINUTES.get(label)
                     if delta is not None:
                         minutes += delta
                     if minutes >= horizon:
                         break
-                    continue
-                names_in_horizon.append(nm)
+                # Append to context
+                current_ids = torch.cat([current_ids, next_token], dim=1)
+                # Early end if EOS
+                if tid == self.vocab.get('<EOS>', -1):
+                    break
+        return generated
+
+    def generate_probs(history_ids: List[int]) -> Dict[str, float]:
+        probs: Dict[str, float] = {t: 0.0 for t in targets}
+        if not history_ids:
+            return probs
+        count_present: Dict[str, int] = {t: 0 for t in targets}
+        for _ in range(args.num_samples):
+            cont = _generate_until_horizon(history_ids)
+            names_in_horizon: list[str] = [id_to_token.get(tid, "") for tid in cont]
             name_set = set(names_in_horizon)
             for key, vars_set in target_variants.items():
                 if any(v in name_set for v in vars_set):
@@ -705,18 +723,8 @@ def main() -> None:
             # Single-sample generation preview
             gen_names: List[str] = []
             try:
-                with torch.no_grad():
-                    inp = torch.tensor([hist[-args.max_input_len:]], dtype=torch.long, device=device)
-                    out = model.generate(
-                        inp,
-                        max_length=len(hist[-args.max_input_len:]) + args.max_gen_tokens,
-                        temperature=args.temperature,
-                        top_k=args.top_k,
-                        top_p=args.top_p,
-                        do_sample=True,
-                    )
-                cont = out[0, inp.size(1):].tolist()
-                gen_names = [id_to_token.get(tid, "") for tid in cont[:args.debug_tokens]]
+                cont_dbg = _generate_until_horizon(hist)
+                gen_names = [id_to_token.get(tid, "") for tid in cont_dbg[:args.debug_tokens]]
             except Exception:
                 pass
             # Future preview without leading structural tokens
