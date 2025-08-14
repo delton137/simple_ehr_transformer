@@ -432,32 +432,21 @@ def load_processed_data(data_dir: str):
 def main():
     """Main training function"""
     parser = argparse.ArgumentParser(description='Train ETHOS Transformer Model')
-    parser.add_argument('--data_dir', type=str, default='processed_data',
-                       help='Directory containing processed data (default: processed_data/)')
-    parser.add_argument('--tag', type=str, default=None,
-                       help='Dataset tag to use (e.g., aou_2023, mimic_iv)')
-    parser.add_argument('--batch_size', type=int, default=8,
-                       help='Training batch size per process (default: 8)')
-    parser.add_argument('--max_epochs', type=int, default=100,
-                       help='Maximum training epochs (default: 100)')
-    parser.add_argument('--learning_rate', type=float, default=3e-4,
-                       help='Learning rate (default: 3e-4)')
-    parser.add_argument('--device', type=str, default='auto',
-                       choices=['auto', 'cuda', 'cpu'],
-                       help='Device to use (default: auto)')
-
-    parser.add_argument('--max_seq_len', type=int, default=1024,
-                       help='Max sequence length per sample (default: 1024)')
+    parser.add_argument('--data_dir', type=str, default='processed_data', help='Directory containing processed data (default: processed_data/)')
+    parser.add_argument('--tag', type=str, default=None,   help='Dataset tag to use (e.g., aou, mimic)')
+    parser.add_argument('--batch_size', type=int, default=8,  help='Training batch size per process (default: 8)')
+    parser.add_argument('--max_epochs', type=int, default=100,  help='Maximum training epochs (default: 100)')
+    parser.add_argument('--learning_rate', type=float, default=3e-4,  help='Learning rate (default: 3e-4)')
+    parser.add_argument('--device', type=str, default='auto',  choices=['auto', 'cuda', 'cpu'], help='Device to use (default: auto)')
+    parser.add_argument('--max_seq_len', type=int, default=1024, help='Max sequence length per sample (default: 1024)')
     parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps (default: 4)')
     parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
     parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
     parser.add_argument('--validate_every_steps', type=int, default=4000, help='Run validation every N optimizer steps (default: 4000). Set 0 to disable step-based validation.')
     parser.add_argument('--checkpoint_every_steps', type=int, default=20000, help='Save a snapshot checkpoint every N optimizer steps (default: 20000). Set 0 to disable step snapshots.')
-    parser.add_argument('--print_timeline_stats', action='store_true',
-                       help='Print train/val patient counts and training timeline length histogram before training')
-    parser.add_argument('--print_random_timeline', action='store_true',
-                       help='Print a random patient timeline (decoded tokens) before training')
+    parser.add_argument('--print_timeline_stats', action='store_true', help='Print train/val patient counts and training timeline length histogram before training')
+    parser.add_argument('--print_random_timeline', action='store_true', help='Print a random patient timeline (decoded tokens) before training')
 
     args = parser.parse_args()
 

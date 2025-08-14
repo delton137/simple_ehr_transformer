@@ -525,6 +525,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
+    p.add_argument("--targets", type=str, default=None, help="Comma-separated list of target token names, e.g. CONDITION_201826,CONDITION_444070,CONDITION_316139")
     p.add_argument("--vocab_path", type=str, default=None, help="Optional explicit path to vocabulary.pkl matching the checkpoint")
     return p.parse_args()
 
@@ -576,16 +577,32 @@ def main() -> None:
 
     id_to_token = {tid: name for name, tid in vocab.items()}
 
-    # Targets: Type 2 diabetes (both new and legacy prefixes supported)
-    targets: List[str] = ["CONDITION_OCCURRENCE_201826", "CONDITION_201826"]
+    # Targets: allow user-provided list; add legacy/table-inclusive variants automatically
+    if args.targets:
+        targets: List[str] = [t.strip() for t in args.targets.split(',') if t.strip()]
+    else:
+        targets: List[str] = ["CONDITION_201826"]
     target_variants: Dict[str, set] = {}
+    def expand_variants(token_name: str) -> set:
+        s = {token_name}
+        # CONDITION
+        if token_name.startswith("CONDITION_OCCURRENCE_"):
+            s.add(token_name.replace("CONDITION_OCCURRENCE_", "CONDITION_", 1))
+        if token_name.startswith("CONDITION_"):
+            s.add(token_name.replace("CONDITION_", "CONDITION_OCCURRENCE_", 1))
+        # DRUG
+        if token_name.startswith("DRUG_EXPOSURE_"):
+            s.add(token_name.replace("DRUG_EXPOSURE_", "DRUG_", 1))
+        if token_name.startswith("DRUG_"):
+            s.add(token_name.replace("DRUG_", "DRUG_EXPOSURE_", 1))
+        # PROCEDURE
+        if token_name.startswith("PROCEDURE_OCCURRENCE_"):
+            s.add(token_name.replace("PROCEDURE_OCCURRENCE_", "PROCEDURE_", 1))
+        if token_name.startswith("PROCEDURE_"):
+            s.add(token_name.replace("PROCEDURE_", "PROCEDURE_OCCURRENCE_", 1))
+        return s
     for t in targets:
-        s = {t}
-        if t.startswith("CONDITION_OCCURRENCE_"):
-            s.add(t.replace("CONDITION_OCCURRENCE_", "CONDITION_", 1))
-        if t.startswith("CONDITION_"):
-            s.add(t.replace("CONDITION_", "CONDITION_OCCURRENCE_", 1))
-        target_variants[t] = s
+        target_variants[t] = expand_variants(t)
 
     def generate_probs(history_ids: List[int]) -> Dict[str, float]:
         probs: Dict[str, float] = {t: 0.0 for t in targets}
