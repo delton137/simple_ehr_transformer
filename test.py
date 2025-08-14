@@ -499,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--patient_limit", type=int, default=None)
     p.add_argument("--targets", type=str, default=None, help="Comma-separated list of target token names, e.g. CONDITION_201826,CONDITION_444070,CONDITION_316139")
+    p.add_argument("--target_names", type=str, default=None, help="Optional comma-separated display names aligned with --targets, used for plot titles")
     p.add_argument("--vocab_path", type=str, default=None, help="Optional explicit path to vocabulary.pkl matching the checkpoint")
     return p.parse_args()
 
@@ -524,6 +525,7 @@ def main() -> None:
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--patient_limit", type=int, default=None)
     p.add_argument("--targets", type=str, required=True)
+    p.add_argument("--target_names", type=str, default=None)
     p.add_argument("--debug_samples", type=int, default=0, help="Print detailed debug for first N patients")
     p.add_argument("--debug_tokens", type=int, default=50, help="How many tokens to print for history/generated samples in debug")
     args = p.parse_args()
@@ -564,6 +566,11 @@ def main() -> None:
 
     # Targets: allow user-provided list; add legacy/table-inclusive variants automatically
     targets: List[str] = [t.strip() for t in args.targets.split(',') if t.strip()]
+    target_titles: Dict[str, str] = {t: t for t in targets}
+    if args.target_names:
+        names_list = [n.strip() for n in args.target_names.split(',')]
+        if len(names_list) == len(targets):
+            target_titles = {t: n for t, n in zip(targets, names_list)}
 
     target_variants: Dict[str, set] = {}
     def expand_variants(token_name: str) -> set:
@@ -718,7 +725,7 @@ def main() -> None:
             counts_in_test[t] += int(labs.get(t, 0))
     print("Target prevalence in test set:")
     for t in targets:
-        print(f"  {t}: {counts_in_test[t]} / {total}")
+        print(f"  {target_titles.get(t, t)}: {counts_in_test[t]} / {total}")
     print(f"Evaluating on {total} patients (balanced across {len(targets)} conditions where possible)")
     for i, pid in enumerate(selected, start=1):
         t0 = time.time()
@@ -785,7 +792,7 @@ def main() -> None:
         plt.plot(fpr, tpr, label=f"AUC={auc_val:.3f}", linewidth=2)
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title(f'ROC: {key}')
+        plt.title(f"ROC: {target_titles.get(key, key)}")
         plt.legend(loc='lower right')
         plt.tight_layout()
         out_path = os.path.join(args.output_dir, f"roc_{_safe_name(key)}.png")
