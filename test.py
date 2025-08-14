@@ -243,34 +243,7 @@ class FutureTester:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Hard-coded tokens to predict
-        self.tokens_to_predict: List[str] = [
-            "CONDITION_201826", #diabetes t2d
-            "CONDITION_444070",	#fatigue
-            "CONDITION_316139", #heart failure
-        ]
-        # Map to actual vocab names present; allow flexible matching
-        self.token_variants: Dict[str, Set[str]] = self._resolve_token_variants(self.tokens_to_predict)
 
-    def _resolve_token_variants(self, desired_tokens: List[str]) -> Dict[str, Set[str]]:
-        """For each desired token, include both legacy and table-inclusive variants.
-        Does not require that variants exist in vocab; matching is done on names.
-        """
-        variants: Dict[str, Set[str]] = {}
-        pairs = [
-            ("CONDITION_OCCURRENCE_", "CONDITION_"),
-            ("DRUG_EXPOSURE_", "DRUG_"),
-            ("PROCEDURE_OCCURRENCE_", "PROCEDURE_"),
-        ]
-        for tok in desired_tokens:
-            s: Set[str] = set([tok])
-            for inc, leg in pairs:
-                if tok.startswith(inc):
-                    s.add(tok.replace(inc, leg, 1))
-                if tok.startswith(leg):
-                    s.add(tok.replace(leg, inc, 1))
-            variants[tok] = s
-        return variants
 
     def _truth_occurrence_for_targets(self, current_events: List[Dict], future_events: List[Dict]) -> Dict[str, int]:
         """Return a map canonical_token -> 0/1 indicating any occurrence in the horizon."""
@@ -578,10 +551,8 @@ def main() -> None:
     id_to_token = {tid: name for name, tid in vocab.items()}
 
     # Targets: allow user-provided list; add legacy/table-inclusive variants automatically
-    if args.targets:
-        targets: List[str] = [t.strip() for t in args.targets.split(',') if t.strip()]
-    else:
-        targets: List[str] = ["CONDITION_201826"]
+    targets: List[str] = [t.strip() for t in args.targets.split(',') if t.strip()]
+
     target_variants: Dict[str, set] = {}
     def expand_variants(token_name: str) -> set:
         s = {token_name}
