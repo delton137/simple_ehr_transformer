@@ -240,12 +240,10 @@ class FutureTester:
         self.model = self.model.to(self.device)
         self.model.eval()
 
-        # Output dir
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Hard-coded tokens to predict (Type 2 diabetes). Include legacy and table-inclusive.
-        # User provided: CONDITION_201826 (correct); earlier typo 20182 ignored.
+        # Hard-coded tokens to predict
         self.tokens_to_predict: List[str] = [
             "CONDITION_201826", #diabetes t2d
             "CONDITION_444070",	#fatigue
@@ -626,35 +624,37 @@ def main() -> None:
     y_prob: Dict[str, List[float]] = {t: [] for t in targets}
     y_true: Dict[str, List[int]] = {t: [] for t in targets}
 
-    # Balanced sampling by future presence of primary target (first in list)
+    # Balanced sampling across multiple conditions: for each target, sample ~N//Y//2 positives and ~N//Y//2 negatives
     import random
-    primary = targets[0]
-    def has_primary_future(pid: int) -> bool:
+    def has_future_token(pid: int, token_key: str) -> bool:
         seq = future_tt.get(pid, [])
         names = {id_to_token.get(tid, "") for tid in seq}
-        return any(v in names for v in target_variants[primary])
+        return any(v in names for v in target_variants[token_key])
 
     if args.patient_limit is not None and len(overlap) > args.patient_limit:
-        pos_pids = [pid for pid in overlap if has_primary_future(pid)]
-        neg_pids = [pid for pid in overlap if not has_primary_future(pid)]
         want = args.patient_limit
-        pos_n = min(want // 2, len(pos_pids))
-        neg_n = min(want - pos_n, len(neg_pids))
-        # If still short, top up from the larger pool
-        if pos_n + neg_n < want:
-            remain = want - (pos_n + neg_n)
-            if len(pos_pids) - pos_n >= len(neg_pids) - neg_n:
-                pos_n = min(len(pos_pids), pos_n + remain)
-            else:
-                neg_n = min(len(neg_pids), neg_n + remain)
-        selected = random.sample(pos_pids, pos_n) + random.sample(neg_pids, neg_n)
+        per_cond_half = max(1, want // max(1, len(targets)) // 2)
+        selected_set = set()
+        for tok in targets:
+            pos_pids = [pid for pid in overlap if has_future_token(pid, tok)]
+            neg_pids = [pid for pid in overlap if not has_future_token(pid, tok)]
+            pos_take = min(per_cond_half, len(pos_pids))
+            neg_take = min(per_cond_half, len(neg_pids))
+            selected_set.update(random.sample(pos_pids, pos_take))
+            selected_set.update(random.sample(neg_pids, neg_take))
+        # Top up to desired size if needed
+        if len(selected_set) < want:
+            remaining = [pid for pid in overlap if pid not in selected_set]
+            extra_take = min(want - len(selected_set), len(remaining))
+            selected_set.update(random.sample(remaining, extra_take))
+        selected = list(selected_set)
         random.shuffle(selected)
     else:
         selected = overlap
 
     per_patient: Dict[int, Dict[str, float]] = {}
     total = len(selected)
-    print(f"Evaluating on {total} patients (balanced by future {primary} where possible)")
+    print(f"Evaluating on {total} patients (balanced across {len(targets)} conditions where possible)")
     for i, pid in enumerate(selected, start=1):
         t0 = time.time()
         hist = current_tt.get(pid, [])
