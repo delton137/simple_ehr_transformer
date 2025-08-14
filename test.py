@@ -618,8 +618,8 @@ def main() -> None:
                         break
                 # Append to context
                 current_ids = torch.cat([current_ids, next_token], dim=1)
-                # Early end if EOS
-                if tid == self.vocab.get('<EOS>', -1):
+                # Early end if EOS (look up by name to avoid self)
+                if name == '<EOS>':
                     break
         return generated
 
