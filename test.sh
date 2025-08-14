@@ -3,9 +3,9 @@ python test.py \
   --current_data_dir processed_data_aou_pre2023_30000 \
   --future_data_dir processed_data_aou_2023_30000 \
   --output_dir test_results_pre_to_2023 \
-  --num_samples 4 \
-  --max_gen_tokens 256 \
+  --num_samples 2 \
+  --max_gen_tokens 1024 \
   --temperature 1.0 \
   --top_k 50 \
   --top_p 0.9 \
-  --patient_limit 100
+  --patient_limit 10
