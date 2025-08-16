@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any, Iterator
+import yaml
 from datetime import datetime, timedelta
 import logging
 from tqdm import tqdm
@@ -1622,6 +1623,22 @@ class OMOPDataProcessor:
         with open(os.path.join(data_config.output_dir, 'patient_timelines.pkl'), 'wb') as f:
             pickle.dump(patient_timelines, f)
         
+        # Save tokenization spec for reproducibility
+        try:
+            spec = {
+                'version': 1,
+                'engine': self.engine,
+                'vocab_size': len(self.vocab),
+                'vocabulary': list(self.vocab.keys()),  # order defines IDs
+                'max_quantile_tokens': model_config.max_quantile_tokens,
+                'quantile_cids': list(self.quantile_mappings.keys()),
+                'date_fallbacks': DATE_FALLBACKS,
+            }
+            with open(os.path.join(data_config.output_dir, 'tokenization.yaml'), 'w') as f:
+                yaml.safe_dump(spec, f, sort_keys=False)
+        except Exception as e:
+            logger.warning(f"Could not write tokenization.yaml: {e}")
+
         logger.info(f"Saved processed data to {data_config.output_dir}")
     
     def load_processed_data(self) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
@@ -1659,6 +1676,8 @@ def main():
                        help='Dataset tag for isolating different datasets (e.g., aou_2023, mimic_iv)')
     parser.add_argument('--engine', type=str, choices=['polars','arrow','python'], default='polars',
                        help='Processing engine: polars (fast), arrow, or python (fallback)')
+    parser.add_argument('--tokenization_spec', type=str, default=None,
+                       help='Path to tokenization.yaml from train split; if provided, reuse its vocabulary and quantile cid set')
     parser.add_argument('--num_workers', type=int, default=None,
                        help='Number of workers for parallel steps (default: CPU cores - 1)')
 
@@ -1698,7 +1717,39 @@ def main():
     # Process data if needed
     if should_reprocess or not os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
         logger.info("Processing new OMOP data...")
+        # Optional: load tokenization spec to reuse vocabulary/quantile cid list
+        spec_vocab: Optional[Dict[str,int]] = None
+        allowed_cids: Optional[set] = None
+        if args.tokenization_spec and os.path.exists(args.tokenization_spec):
+            try:
+                with open(args.tokenization_spec, 'r') as f:
+                    spec = yaml.safe_load(f)
+                vocab_list = spec.get('vocabulary', [])
+                spec_vocab = {tok: idx for idx, tok in enumerate(vocab_list)}
+                allowed_cids = set(spec.get('quantile_cids', []))
+                logger.info(f"Loaded tokenization spec: {len(spec_vocab)} vocab tokens, {len(allowed_cids or [])} quantile cids")
+            except Exception as e:
+                logger.warning(f"Could not load tokenization spec: {e}")
         tokenized_timelines, vocab = processor.process_all_data()
+        # If spec_vocab exists, remap vocab and timelines to it, and filter quantiles by allowed cids
+        if spec_vocab is not None:
+            # Build name->id map for current vocab
+            name_to_id = {name: tid for name, tid in processor.vocab.items()}
+            # Remap timelines by token name where possible
+            id_to_name = {tid: name for name, tid in processor.vocab.items()}
+            remapped: Dict[int, List[int]] = {}
+            unk_id = spec_vocab.get('<UNK>', 1)
+            for pid, seq in tokenized_timelines.items():
+                new_seq: List[int] = []
+                for tid in seq:
+                    name = id_to_name.get(tid, None)
+                    new_seq.append(spec_vocab.get(name, unk_id) if name is not None else unk_id)
+                remapped[pid] = new_seq
+            tokenized_timelines = remapped
+            processor.vocab = spec_vocab
+            processor.vocab_size = len(spec_vocab)
+            if allowed_cids is not None and processor.quantile_mappings:
+                processor.quantile_mappings = {cid: qs for cid, qs in processor.quantile_mappings.items() if cid in allowed_cids}
     else:
         logger.info("Loading existing processed data...")
         tokenized_timelines, vocab = processor.load_processed_data()
