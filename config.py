@@ -20,7 +20,7 @@ class ModelConfig:
     dropout: float = 0.1
     
     # Training parameters
-    batch_size: int = 32
+    batch_size: int = 16
     learning_rate: float = 3e-4
     warmup_steps: int = 4000
     max_epochs: int = 100

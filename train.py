@@ -445,6 +445,7 @@ def main():
     parser.add_argument('--checkpoint_every_steps', type=int, default=20000, help='Save a snapshot checkpoint every N optimizer steps (default: 20000). Set 0 to disable step snapshots.')
     parser.add_argument('--print_timeline_stats', action='store_true', help='Print train/val patient counts and training timeline length histogram before training')
     parser.add_argument('--print_random_timeline', action='store_true', help='Print a random patient timeline (decoded tokens) before training')
+    parser.add_argument('--count_tokens', action='store_true', help='Count total tokens in training set and print to terminal, then exit')
 
     args = parser.parse_args()
 
@@ -568,6 +569,14 @@ def main():
         print(f"✅ Validation batches: {len(val_loader)}")
     except Exception as e:
         print(f"❌ Error creating data loaders: {e}")
+        return
+
+    # Optional early exit: count tokens in training set
+    if args.count_tokens:
+        total_tokens = 0
+        for pid, seq in data_processor.train_data.items():
+            total_tokens += max(0, len(seq))
+        print(f"🧮 Total tokens in training timelines: {total_tokens}")
         return
     
     # Create model
