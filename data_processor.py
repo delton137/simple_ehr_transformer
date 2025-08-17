@@ -1855,6 +1855,7 @@ def main():
                 logger.info(f"Loaded tokenization spec: {len(spec_vocab)} vocab tokens, quantiles for {len(spec_quantiles or {})} cids")
             except Exception as e:
                 logger.warning(f"Could not load tokenization spec: {e}")
+                exit()
         tokenized_timelines, vocab = processor.process_all_data()
         # If spec_vocab exists, remap vocab and timelines to it, and filter quantiles by allowed cids
         if spec_vocab is not None:
