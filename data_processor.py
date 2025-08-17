@@ -1845,7 +1845,7 @@ def main():
         # Optional: load tokenization spec to reuse vocabulary/quantile mappings
         spec_vocab: Optional[Dict[str,int]] = None
         spec_quantiles: Optional[Dict[str, List[float]]] = None
-        if args.tokenization_spec and os.path.exists(args.tokenization_spec):
+        if args.tokenization_spec:
             try:
                 with open(args.tokenization_spec, 'r') as f:
                     spec = yaml.safe_load(f)
