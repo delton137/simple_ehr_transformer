@@ -32,8 +32,6 @@ DATE_FALLBACKS = {
     "visit_detail": "visit_detail_start_date",
     "procedure_occurrence": "procedure_date",
     "device_exposure": "device_exposure_start_date",
-    "note": "note_date",
-    "death": "death_date",
 }
 
 # Fallback to source concept ids when standard concept ids are 0/NULL
@@ -56,6 +54,7 @@ class OMOPDataProcessor:
         self.vocab = {}
         self.vocab_size = 0
         self.quantile_mappings = {}
+        self.concept_counts: Counter = Counter()
         self.age_mappings = {}
         self.time_interval_mappings = {}
         self.static_mappings = {}
@@ -90,6 +89,123 @@ class OMOPDataProcessor:
             "measurement": "MEASUREMENT_",
             "observation": "OBSERVATION_",
         }
+
+    def _load_concept_vocab_map(self) -> Dict[int, str]:
+        """Load OMOP concept table to map concept_id -> vocabulary_id (code system)."""
+        try:
+            concept_dir = os.path.join(self.omop_data_dir, 'concept')
+            if not os.path.isdir(concept_dir):
+                return {}
+            # Read all parquet files in concept dir
+            files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
+            if not files:
+                return {}
+            # Use Polars if available
+            df = pl.read_parquet(files, columns=["concept_id", "vocabulary_id"]) if pl is not None else None
+            if df is not None and df.height:
+                return {int(cid): str(vocab) for cid, vocab in df.iter_rows()}
+        except Exception:
+            return {}
+        return {}
+
+    def _load_concept_lookup(self) -> Dict[int, Dict[str, Any]]:
+        """Load concept_id -> {concept_name, domain_id, vocabulary_id, concept_code}."""
+        try:
+            concept_dir = os.path.join(self.omop_data_dir, 'concept')
+            if not os.path.isdir(concept_dir):
+                return {}
+            files = [os.path.join(concept_dir, f) for f in os.listdir(concept_dir) if f.endswith('.parquet')]
+            if not files:
+                return {}
+            df = pl.read_parquet(files, columns=[
+                "concept_id", "concept_name", "domain_id", "vocabulary_id", "concept_code"
+            ]) if pl is not None else None
+            if df is None or df.height == 0:
+                return {}
+            return {
+                int(r[0]): {
+                    "concept_name": r[1],
+                    "domain_id": r[2],
+                    "vocabulary_id": r[3],
+                    "concept_code": r[4],
+                }
+                for r in df.iter_rows()
+            }
+        except Exception:
+            return {}
+
+    def _load_maps_to_lookup(self) -> Dict[int, int]:
+        """Load source->standard concept_id mapping via 'Maps to' relationship (concept_id_1 -> concept_id_2)."""
+        try:
+            rel_dir = os.path.join(self.omop_data_dir, 'concept_relationship')
+            if not os.path.isdir(rel_dir):
+                return {}
+            files = [os.path.join(rel_dir, f) for f in os.listdir(rel_dir) if f.endswith('.parquet')]
+            if not files:
+                return {}
+            df = pl.read_parquet(files, columns=["concept_id_1", "concept_id_2", "relationship_id"]) if pl is not None else None
+            if df is None or df.height == 0:
+                return {}
+            df = df.filter(pl.col("relationship_id") == "Maps to")
+            return {int(a): int(b) for a, b, _ in df.iter_rows()}
+        except Exception:
+            return {}
+
+    def _build_concept_listing(self) -> List[Dict[str, Any]]:
+        """Create a list of dicts describing each concept token used with metadata and counts."""
+        if not self.concept_counts:
+            return []
+        table_col_map = {
+            'CONDITION_OCCURRENCE_': ("condition_occurrence", "condition_concept_id"),
+            'DRUG_EXPOSURE_': ("drug_exposure", "drug_concept_id"),
+            'PROCEDURE_OCCURRENCE_': ("procedure_occurrence", "procedure_concept_id"),
+            'MEASUREMENT_': ("measurement", "measurement_concept_id"),
+            'OBSERVATION_': ("observation", "observation_concept_id"),
+        }
+        source_col_map = {
+            'condition_occurrence': SOURCE_CONCEPT_FALLBACK.get('condition_occurrence'),
+            'drug_exposure': SOURCE_CONCEPT_FALLBACK.get('drug_exposure'),
+            'measurement': SOURCE_CONCEPT_FALLBACK.get('measurement'),
+            'observation': SOURCE_CONCEPT_FALLBACK.get('observation'),
+            'procedure_occurrence': SOURCE_CONCEPT_FALLBACK.get('procedure_occurrence'),
+        }
+        concept_meta = self._load_concept_lookup()
+        maps_to = self._load_maps_to_lookup()
+        listing: List[Dict[str, Any]] = []
+        for token_name, cnt in self.concept_counts.items():
+            for pref, (table, col) in table_col_map.items():
+                if token_name.startswith(pref):
+                    try:
+                        cid = int(token_name[len(pref):])
+                    except Exception:
+                        continue
+                    meta = concept_meta.get(cid, {})
+                    item: Dict[str, Any] = {
+                        'token': token_name,
+                        'table': table,
+                        'concept_column': col,
+                        'source_concept_column': source_col_map.get(table),
+                        'concept_id': cid,
+                        'concept_name': meta.get('concept_name'),
+                        'domain_id': meta.get('domain_id'),
+                        'code_system': meta.get('vocabulary_id'),
+                        'concept_code': meta.get('concept_code'),
+                        'count': int(cnt),
+                    }
+                    std_id = maps_to.get(cid)
+                    if std_id is not None:
+                        std_meta = concept_meta.get(std_id, {})
+                        item.update({
+                            'standard_concept_id': std_id,
+                            'standard_concept_name': std_meta.get('concept_name'),
+                            'standard_vocabulary_id': std_meta.get('vocabulary_id'),
+                            'standard_concept_code': std_meta.get('concept_code'),
+                        })
+                    listing.append(item)
+                    break
+        # Sort deterministically
+        listing.sort(key=lambda x: (x['table'], x['concept_column'], x['concept_id']))
+        return listing
 
     # =====================
     # Fast path (Polars)
@@ -413,7 +529,12 @@ class OMOPDataProcessor:
         person_data = self._load_person_static_pl()
         # Create mappings
         concept_counts, quantiles = self._compute_stats_polars(events)
-        self.quantile_mappings = quantiles
+        self.concept_counts = concept_counts
+        # If quantiles already provided (e.g., from a tokenization spec), keep them
+        if not self.quantile_mappings:
+            self.quantile_mappings = quantiles
+        else:
+            logger.info("[FAST] Using quantile mappings from provided spec; skipping recomputed quantiles")
         self.create_age_mappings()
         self.create_time_interval_mappings()
         # Build vocabulary using counts
@@ -1625,14 +1746,18 @@ class OMOPDataProcessor:
         
         # Save tokenization spec for reproducibility
         try:
+            # Convert numpy arrays to plain lists for YAML compatibility
+            qmap_yaml = {str(cid): (vals.tolist() if hasattr(vals, 'tolist') else list(vals)) for cid, vals in self.quantile_mappings.items()}
+            concept_listing = self._build_concept_listing()
             spec = {
                 'version': 1,
                 'engine': self.engine,
                 'vocab_size': len(self.vocab),
                 'vocabulary': list(self.vocab.keys()),  # order defines IDs
                 'max_quantile_tokens': model_config.max_quantile_tokens,
-                'quantile_cids': list(self.quantile_mappings.keys()),
+                'quantile_mappings': qmap_yaml,
                 'date_fallbacks': DATE_FALLBACKS,
+                'concepts': concept_listing,
             }
             with open(os.path.join(data_config.output_dir, 'tokenization.yaml'), 'w') as f:
                 yaml.safe_dump(spec, f, sort_keys=False)
@@ -1717,17 +1842,17 @@ def main():
     # Process data if needed
     if should_reprocess or not os.path.exists(os.path.join(data_config.output_dir, 'tokenized_timelines.pkl')):
         logger.info("Processing new OMOP data...")
-        # Optional: load tokenization spec to reuse vocabulary/quantile cid list
+        # Optional: load tokenization spec to reuse vocabulary/quantile mappings
         spec_vocab: Optional[Dict[str,int]] = None
-        allowed_cids: Optional[set] = None
+        spec_quantiles: Optional[Dict[str, List[float]]] = None
         if args.tokenization_spec and os.path.exists(args.tokenization_spec):
             try:
                 with open(args.tokenization_spec, 'r') as f:
                     spec = yaml.safe_load(f)
                 vocab_list = spec.get('vocabulary', [])
                 spec_vocab = {tok: idx for idx, tok in enumerate(vocab_list)}
-                allowed_cids = set(spec.get('quantile_cids', []))
-                logger.info(f"Loaded tokenization spec: {len(spec_vocab)} vocab tokens, {len(allowed_cids or [])} quantile cids")
+                spec_quantiles = spec.get('quantile_mappings', None)
+                logger.info(f"Loaded tokenization spec: {len(spec_vocab)} vocab tokens, quantiles for {len(spec_quantiles or {})} cids")
             except Exception as e:
                 logger.warning(f"Could not load tokenization spec: {e}")
         tokenized_timelines, vocab = processor.process_all_data()
@@ -1748,8 +1873,12 @@ def main():
             tokenized_timelines = remapped
             processor.vocab = spec_vocab
             processor.vocab_size = len(spec_vocab)
-            if allowed_cids is not None and processor.quantile_mappings:
-                processor.quantile_mappings = {cid: qs for cid, qs in processor.quantile_mappings.items() if cid in allowed_cids}
+            if spec_quantiles is not None:
+                # Enforce exact quantile boundaries from spec
+                try:
+                    processor.quantile_mappings = {str(k): np.array(v) for k, v in spec_quantiles.items()}
+                except Exception:
+                    processor.quantile_mappings = {str(k): np.array(v, dtype=float) for k, v in spec_quantiles.items()}
     else:
         logger.info("Loading existing processed data...")
         tokenized_timelines, vocab = processor.load_processed_data()

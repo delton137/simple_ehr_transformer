@@ -5,13 +5,13 @@ Optimized for large OMOP datasets
 
 import os
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict
 
 @dataclass
 class ModelConfig:
     """Model configuration parameters"""
     # Model architecture
-    vocab_size: int = 50000  # Increased to allow for more concept tokens
+    vocab_size: int = 20000
     d_model: int = 768
     n_heads: int = 12
     n_layers: int = 12
@@ -48,11 +48,16 @@ class DataConfig:
     def __post_init__(self):
         if self.omop_tables is None:
             self.omop_tables = [
-                "person", "observation_period", "visit_occurrence",
-                "condition_occurrence", "drug_exposure", "procedure_occurrence",
-                "measurement", "observation", "death"
+                "person", 
+                "visit_occurrence",
+                "condition_occurrence", 
+                "drug_exposure", 
+                "procedure_occurrence",
+                "measurement", 
+                "observation",
             ]
-    
+
+
     # Large dataset optimizations
     chunk_size: int = 10000  # Process data in chunks to manage memory
     max_patients_per_chunk: int = 5000  # Maximum patients to process in memory at once

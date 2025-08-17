@@ -69,7 +69,6 @@ def get_concept_name(
             print(f"[WARN] concept_id {concept_id} not found in {table}.")
             return None
         
-        # Return as plain Python string
         return result[0]
     except Exception as e:
         print(f"[ERROR] Failed to lookup concept_id {concept_id} in {table}: {e}")
