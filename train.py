@@ -296,8 +296,9 @@ class ETHOSTrainer:
         
         # Save best checkpoint if this is the best so far
         if is_best:
-            torch.save(checkpoint, os.path.join(self.model_dir, 'best_checkpoint.pth'))
-            logger.info(f"Saved best checkpoint with validation loss: {self.best_val_loss:.4f}")
+            best_with_step_fp = os.path.join(self.model_dir, f"best_checkpoint_step_{self.global_step:07d}.pth")
+            torch.save(checkpoint, best_with_step_fp)
+            logger.info(f"Saved best checkpoint with validation loss: {self.best_val_loss:.4f} ({best_with_step_fp})")
 
     def save_step_checkpoint(self, step: int):
         """Save a snapshot checkpoint with step number to allow caching."""
