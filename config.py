@@ -16,15 +16,24 @@ class ModelConfig:
     n_heads: int = 12
     n_layers: int = 12
     d_ff: int = 3072
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024
     dropout: float = 0.1
     
     # Training parameters
-    batch_size: int = 16
+    batch_size: int = 4
     learning_rate: float = 3e-4
     warmup_steps: int = 4000
     max_epochs: int = 100
     gradient_clip: float = 1.0
+    grad_accum_steps: int = 2  # Gradient accumulation steps for memory management (reduce to 1 if OOM, increase to 4+ for larger effective batch)
+    
+    # Memory optimization parameters
+    use_amp: bool = True  # Automatic Mixed Precision for memory efficiency
+    max_seq_len: int = 1024  # Reduced from 2048 for memory efficiency
+    d_model: int = 512  # Reduced from 768 for memory efficiency
+    n_heads: int = 8  # Reduced from 12 for memory efficiency
+    n_layers: int = 8  # Reduced from 12 for memory efficiency
+    d_ff: int = 2048  # Reduced from 3072 for memory efficiency
     
     # Tokenization parameters
     max_age_tokens: int = 20  # Age intervals (0-5, 5-10, etc.)

@@ -438,7 +438,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=3e-4,  help='Learning rate (default: 3e-4)')
     parser.add_argument('--device', type=str, default='auto',  choices=['auto', 'cuda', 'cpu'], help='Device to use (default: auto)')
     parser.add_argument('--max_seq_len', type=int, default=1024, help='Max sequence length per sample (default: 1024)')
-    parser.add_argument('--grad_accum_steps', type=int, default=4, help='Gradient accumulation steps (default: 4)')
+    parser.add_argument('--grad_accum_steps', type=int, default=model_config.grad_accum_steps, help=f'Gradient accumulation steps (default: {model_config.grad_accum_steps})')
     parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
     parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
     parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
@@ -495,8 +495,8 @@ def main():
             pass
     
     # Auto-enable AMP on CUDA if user didn't specify flag
-    if device.type == 'cuda': 
-        args.use_amp = True
+    if device.type == 'cuda' and not hasattr(args, 'use_amp'): 
+        args.use_amp = model_config.use_amp
     
     # Load data
     print("\n📊 Loading data...")
@@ -583,7 +583,16 @@ def main():
     # Create model
     print("\n🏗️  Creating model...")
     try:
-        model = create_ethos_model(len(vocab))
+        # Use config values for model creation
+        model = ETHOSTransformer(
+            vocab_size=len(vocab),
+            d_model=model_config.d_model,
+            n_heads=model_config.n_heads,
+            n_layers=model_config.n_layers,
+            d_ff=model_config.d_ff,
+            max_seq_len=args.max_seq_len,
+            dropout=model_config.dropout,
+        )
         model = model.to(device)
         try:
             num_params = model.count_parameters()  # type: ignore[attr-defined]
