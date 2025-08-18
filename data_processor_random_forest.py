@@ -211,15 +211,20 @@ def main():
     print("Writing features.tsv...")
     with open(os.path.join(out_dir, 'features.tsv'), 'w') as f:
         f.write("index\ttoken\tconcept_id\tcount\n")
-        for idx, (tok, concept_id, cnt) in tqdm(zip(feature_tokens, [r[2] for r in feature_rows], feature_counts), 
-                                                 total=len(feature_tokens), 
-                                                 desc="Writing features"):
+        concept_ids = [r[2] for r in feature_rows]
+        for idx in tqdm(range(len(feature_tokens)), total=len(feature_tokens), desc="Writing features"):
+            tok = feature_tokens[idx]
+            concept_id = concept_ids[idx] if idx < len(concept_ids) else ''
+            cnt = feature_counts[idx]
             f.write(f"{idx}\t{tok}\t{concept_id}\t{cnt}\n")
 
     print(f"Saved X, y, patient_ids, and features to {out_dir}")
     print(f"Final dataset: {num_patients} patients × {num_features} features")
     print(f"Target distribution: {np.sum(y)} positive, {num_patients - np.sum(y)} negative")
-    print(f"Feature matrix shape: X={X.shape}, y={y.shape}")
+    if use_sparse:
+        print(f"Feature matrix shape: X={X_sparse.shape}, y={y.shape}")
+    else:
+        print(f"Feature matrix shape: X={X.shape}, y={y.shape}")
 
 
 if __name__ == '__main__':
