@@ -27,6 +27,10 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import Counter
 from tqdm import tqdm
+try:
+    import scipy.sparse as sp
+except Exception:
+    sp = None
 
 
 CONCEPT_PREFIXES = (
@@ -98,6 +102,7 @@ def main():
     ap.add_argument('--data_dir', required=True, help='Processed data directory (with tokenization.yaml, vocabulary.pkl, tokenized_timelines.pkl)')
     ap.add_argument('--out_dir', default=None, help='Output directory (default: <data_dir>_rf)')
     ap.add_argument('--min_count', type=int, default=0, help='Drop tokens with total count < min_count (from spec)')
+    ap.add_argument('--sparse', action='store_true', help='Build a sparse CSR matrix (saves X_sparse.npz) to reduce RAM')
     ap.add_argument('--target_concept_id', type=int, default=None, help='Target concept_id; all tokens in spec with this concept_id will be removed and added to y')
     args = ap.parse_args()
 
@@ -154,24 +159,52 @@ def main():
     patient_ids = sorted(tokenized_timelines.keys())
     num_patients = len(patient_ids)
     num_features = len(feature_tokens)
-    X = np.zeros((num_patients, num_features), dtype=np.int32)
-    y = np.zeros((num_patients,), dtype=np.int8)
+    y = np.zeros((num_patients,), dtype=np.uint8)
 
     feature_id_to_col = {tid: col for col, tid in enumerate(feature_ids) if tid != -1}
 
-    print(f"Building feature matrix for {num_patients} patients...")
-    for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
-        seq = tokenized_timelines[pid]
-        counts = Counter(seq)
-        # Features
-        for tid, col in feature_id_to_col.items():
-            X[row, col] = counts.get(tid, 0)
-        # Target label: presence of any target id
-        y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
+    use_sparse = bool(args.sparse)
+    # Auto-enable sparse if very wide
+    if not use_sparse and num_features > 10000:
+        use_sparse = True
+
+    print(f"Building feature matrix for {num_patients} patients... (sparse={use_sparse})")
+    if use_sparse:
+        if sp is None:
+            raise RuntimeError("scipy is required for --sparse output (pip install scipy)")
+        rows: List[int] = []
+        cols: List[int] = []
+        data: List[int] = []
+        for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
+            seq = tokenized_timelines[pid]
+            counts = Counter(seq)
+            # Emit only non-zero features
+            for tid, cnt in counts.items():
+                col = feature_id_to_col.get(tid)
+                if col is not None and cnt:
+                    rows.append(row)
+                    cols.append(col)
+                    data.append(int(cnt))
+            # Target label: presence of any target id
+            y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
+        X_sparse = sp.coo_matrix((data, (rows, cols)), shape=(num_patients, num_features), dtype=np.int32).tocsr()
+    else:
+        X = np.zeros((num_patients, num_features), dtype=np.int32)
+        for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
+            seq = tokenized_timelines[pid]
+            counts = Counter(seq)
+            # Features
+            for tid, col in feature_id_to_col.items():
+                X[row, col] = counts.get(tid, 0)
+            # Target label: presence of any target id
+            y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
 
     # Save outputs
     print("Saving outputs...")
-    np.save(os.path.join(out_dir, 'X.npy'), X)
+    if use_sparse:
+        sp.save_npz(os.path.join(out_dir, 'X_sparse.npz'), X_sparse)
+    else:
+        np.save(os.path.join(out_dir, 'X.npy'), X)
     np.save(os.path.join(out_dir, 'y.npy'), y)
     np.save(os.path.join(out_dir, 'patient_ids.npy'), np.array(patient_ids, dtype=np.int64))
     
