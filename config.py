@@ -25,7 +25,7 @@ class ModelConfig:
     warmup_steps: int = 4000
     max_epochs: int = 100
     gradient_clip: float = 1.0
-    grad_accum_steps: int = 2  # Gradient accumulation steps for memory management (reduce to 1 if OOM, increase to 4+ for larger effective batch)
+    grad_accum_steps: int = 1  # Gradient accumulation steps for memory management (reduce to 1 if OOM, increase to 4+ for larger effective batch)
     
     # Memory optimization parameters
     use_amp: bool = True  # Automatic Mixed Precision for memory efficiency

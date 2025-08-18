@@ -51,7 +51,7 @@ def load_processed(data_dir: str):
     return vocab, tokenized_timelines, spec
 
 
-def feature_tokens_from_spec(spec: dict, feature_limit: Optional[int] = None, min_count: int = 0) -> List[Tuple[str, int]]:
+def feature_tokens_from_spec(spec: dict, min_count: int = 0) -> List[Tuple[str, int]]:
     """Return list of (token_name, count), ordered by count desc, optionally filtered.
     Expects spec['concepts'] entries with 'token' and 'count'. Falls back to empty list if missing.
     """
@@ -67,8 +67,6 @@ def feature_tokens_from_spec(spec: dict, feature_limit: Optional[int] = None, mi
         feats.append((tok, cnt))
     # Sort by count desc, then token name for stability
     feats.sort(key=lambda x: (-x[1], x[0]))
-    if feature_limit is not None and feature_limit > 0:
-        feats = feats[:feature_limit]
     return feats
 
 
@@ -91,7 +89,6 @@ def main():
     ap = argparse.ArgumentParser(description='Build RF feature matrix (X, y) from processed tokenization outputs')
     ap.add_argument('--data_dir', required=True, help='Processed data directory (with tokenization.yaml, vocabulary.pkl, tokenized_timelines.pkl)')
     ap.add_argument('--out_dir', default=None, help='Output directory (default: <data_dir>_rf)')
-    ap.add_argument('--feature_limit', type=int, default=None, help='Keep only top-N tokens by dataset count (from spec)')
     ap.add_argument('--min_count', type=int, default=0, help='Drop tokens with total count < min_count (from spec)')
     target = ap.add_argument_group('Target options')
     target.add_argument('--target_token', type=str, default=None, help='Target token name, e.g., CONDITION_OCCURRENCE_201826')
@@ -116,7 +113,7 @@ def main():
         raise ValueError('Could not resolve any target tokens from the provided arguments')
 
     # Build feature set from spec concepts ordered by count desc
-    feats_with_counts = feature_tokens_from_spec(spec, feature_limit=args.feature_limit, min_count=args.min_count)
+    feats_with_counts = feature_tokens_from_spec(spec, min_count=args.min_count)
     feature_tokens = [t for t, _ in feats_with_counts]
     feature_counts = [c for _, c in feats_with_counts]
 
@@ -175,20 +172,6 @@ def main():
         f.write("index\ttoken\tconcept_id\tcount\n")
         for idx, (tok, concept_id, cnt) in enumerate(zip(feature_tokens, [r[2] for r in feature_rows], feature_counts)):
             f.write(f"{idx}\t{tok}\t{concept_id}\t{cnt}\n")
-
-    # Metadata for reproducibility
-    meta = {
-        'data_dir': args.data_dir,
-        'out_dir': out_dir,
-        'num_patients': num_patients,
-        'num_features': num_features,
-        'target_tokens': list(target_tokens),
-        'target_removed_from_features': True,
-        'feature_limit': args.feature_limit,
-        'min_count': args.min_count,
-    }
-    with open(os.path.join(out_dir, 'meta.json'), 'w') as f:
-        json.dump(meta, f, indent=2)
 
     print(f"Saved X, y, patient_ids, and features to {out_dir}")
 
