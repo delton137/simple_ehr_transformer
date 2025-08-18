@@ -111,49 +111,38 @@ This creates separate directories:
 
 ### 2. Training
 
-Train the ETHOS transformer model (memory-friendly, multi-GPU enabled):
+Train the ETHOS transformer model using the simplified interface:
 
 ```bash
-# Optional: select multiple GPUs and improve allocator behavior
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Basic training with default parameters from config.py
+python train.py --tag aou_2023 --data_dir processed_data_aou_2023
 
-python train.py \
-  --data_dir processed_data \
-  --batch_size 8 \
-  --grad_accum_steps 4 \
-  --max_seq_len 1024 \
-  --use_amp \
-  --max_epochs 100 \
-  --learning_rate 3e-4 \
-  --device cuda
+# Training with custom config file
+python train.py --tag aou_2023 --data_dir processed_data_aou_2023 --config_file config_memory_efficient.py
 
-# Tagged dataset
-python train.py --tag aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --device cuda
-
-# Custom data directory
-python train.py --data_dir processed_data_aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --device cuda
+# Count tokens only (for analysis)
+python train.py --tag aou_2023 --data_dir processed_data_aou_2023 --count_tokens
 ```
 
-Training options:
+**Training options:**
 - `--tag`: Dataset tag to use (automatically finds `processed_data_{tag}/`)
 - `--data_dir`: Directory containing processed data (default: `processed_data/`)
-- `--batch_size`: Training batch size (default: 32)
-- `--grad_accum_steps`: Gradient accumulation steps (default: 1)
-- `--max_seq_len`: Max sequence length per sample (default: from config)
-- `--use_amp`: Enable mixed precision
-- `--max_epochs`: Maximum training epochs (default: 100)
-- `--learning_rate`: Learning rate (default: 3e-4)
-- `--device`: Device to use (auto/cuda/cpu, default: auto)
-- `--resume`: Resume from checkpoint
+- `--config_file`: Path to custom config file (default: `config.py`)
+- `--count_tokens`: Count total tokens and exit (for analysis)
+
+**All other parameters are configured in config.py:**
+- Model architecture: `d_model`, `n_heads`, `n_layers`, `d_ff`, `max_seq_len`
+- Training: `batch_size`, `learning_rate`, `max_epochs`, `grad_accum_steps`
+- Memory: `use_amp`, `num_workers`
+- Logging: `log_every`, `validate_every_steps`, `checkpoint_every_steps`
 
 **Tag-based Training:**
 ```bash
 # Train on All of Us 2023 data
-python train.py --tag aou_2023 --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --max_epochs 200
+python train.py --tag aou_2023 --data_dir processed_data_aou_2023
 
 # Train on MIMIC-IV data  
-python train.py --tag mimic_iv --batch_size 8 --grad_accum_steps 4 --max_seq_len 1024 --use_amp --max_epochs 100
+python train.py --tag mimic_iv --data_dir processed_data_mimic_iv
 
 # Models are saved to separate directories:
 # - models/aou_2023/

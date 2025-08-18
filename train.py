@@ -28,8 +28,7 @@ def load_config(config_file: str = None):
         spec.loader.exec_module(custom_config_module)
         return custom_config_module.model_config
     else:
-        # Use default config from config.py
-        return model_config
+        return model_config #default config 
 
 logging.basicConfig(
     level=logging.INFO,
