@@ -26,6 +26,7 @@ import json
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import Counter
+from tqdm import tqdm
 
 
 CONCEPT_PREFIXES = (
@@ -42,12 +43,19 @@ def load_processed(data_dir: str):
     spec_path = os.path.join(data_dir, 'tokenization.yaml')
     if not (os.path.exists(vocab_path) and os.path.exists(tt_path) and os.path.exists(spec_path)):
         raise FileNotFoundError(f"Missing required files in {data_dir}. Need vocabulary.pkl, tokenized_timelines.pkl, tokenization.yaml")
+    
+    print("Loading vocabulary...")
     with open(vocab_path, 'rb') as f:
         vocab: Dict[str, int] = pickle.load(f)
+    
+    print("Loading tokenized timelines...")
     with open(tt_path, 'rb') as f:
         tokenized_timelines: Dict[int, List[int]] = pickle.load(f)
+    
+    print("Loading tokenization specification...")
     with open(spec_path, 'r') as f:
         spec = yaml.safe_load(f)
+    
     return vocab, tokenized_timelines, spec
 
 
@@ -113,20 +121,27 @@ def main():
         raise ValueError('Could not resolve any target tokens from the provided arguments')
 
     # Build feature set from spec concepts ordered by count desc
+    print("Building feature set from concepts...")
     feats_with_counts = feature_tokens_from_spec(spec, min_count=args.min_count)
     feature_tokens = [t for t, _ in feats_with_counts]
     feature_counts = [c for _, c in feats_with_counts]
+    print(f"Found {len(feature_tokens)} features with min_count >= {args.min_count}")
 
     # Always remove target tokens from features to avoid leakage
+    print(f"Target tokens: {target_tokens}")
     feature_mask = [t not in set(target_tokens) for t in feature_tokens]
     feature_tokens = [t for t, keep in zip(feature_tokens, feature_mask) if keep]
     feature_counts = [c for c, keep in zip(feature_counts, feature_mask) if keep]
+    print(f"Features after removing targets: {len(feature_tokens)}")
 
     # Map feature tokens to ids via vocabulary
     token_name_to_id = vocab  # str -> int
     feature_ids: List[int] = []
     feature_rows = []
-    for idx, (tok, cnt) in enumerate(zip(feature_tokens, feature_counts)):
+    print("Mapping feature tokens to IDs...")
+    for idx, (tok, cnt) in tqdm(enumerate(zip(feature_tokens, feature_counts)), 
+                                total=len(feature_tokens), 
+                                desc="Processing features"):
         tid = token_name_to_id.get(tok)
         if tid is None:
             # Skip tokens not in vocab (mismatch); log row but with -1 id
@@ -155,7 +170,8 @@ def main():
 
     feature_id_to_col = {tid: col for col, tid in enumerate(feature_ids) if tid != -1}
 
-    for row, pid in enumerate(patient_ids):
+    print(f"Building feature matrix for {num_patients} patients...")
+    for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
         seq = tokenized_timelines[pid]
         counts = Counter(seq)
         # Features
@@ -165,15 +181,23 @@ def main():
         y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
 
     # Save outputs
+    print("Saving outputs...")
     np.save(os.path.join(out_dir, 'X.npy'), X)
     np.save(os.path.join(out_dir, 'y.npy'), y)
     np.save(os.path.join(out_dir, 'patient_ids.npy'), np.array(patient_ids, dtype=np.int64))
+    
+    print("Writing features.tsv...")
     with open(os.path.join(out_dir, 'features.tsv'), 'w') as f:
         f.write("index\ttoken\tconcept_id\tcount\n")
-        for idx, (tok, concept_id, cnt) in enumerate(zip(feature_tokens, [r[2] for r in feature_rows], feature_counts)):
+        for idx, (tok, concept_id, cnt) in tqdm(zip(feature_tokens, [r[2] for r in feature_rows], feature_counts), 
+                                                 total=len(feature_tokens), 
+                                                 desc="Writing features"):
             f.write(f"{idx}\t{tok}\t{concept_id}\t{cnt}\n")
 
     print(f"Saved X, y, patient_ids, and features to {out_dir}")
+    print(f"Final dataset: {num_patients} patients × {num_features} features")
+    print(f"Target distribution: {np.sum(y)} positive, {num_patients - np.sum(y)} negative")
+    print(f"Feature matrix shape: X={X.shape}, y={y.shape}")
 
 
 if __name__ == '__main__':
