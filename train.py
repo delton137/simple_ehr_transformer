@@ -482,28 +482,23 @@ def main():
     print(f"📈 Max epochs: {model_config.max_epochs}")
     print(f"📚 Learning rate: {model_config.learning_rate}")
     
-    # Set device
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
-    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     print(f"💻 Device: {device}")
     # Enable TF32 for speed/memory on Ampere+ GPUs
     if device.type == 'cuda':
         try:
             torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
             torch.set_float32_matmul_precision('medium')  # type: ignore[attr-defined]
-        except Exception:
+        except Exception as e:
+            print(f"❌ Error enabling TF32: {e}")
             pass
     
-    # Auto-enable AMP on CUDA
     if device.type == 'cuda': 
         use_amp = model_config.use_amp
     else:
         use_amp = False
     
-    # Load data
     print("\n📊 Loading data...")
     try:
         tokenized_timelines, vocab = load_processed_data(args.data_dir)
