@@ -15,7 +15,7 @@ class ModelConfig:
     d_model: int = 768
     n_heads: int = 12
     n_layers: int = 12
-    d_ff: int = 3072
+    d_ff: int = 2048
     max_seq_len: int = 1024
     dropout: float = 0.1
     
@@ -29,11 +29,20 @@ class ModelConfig:
     
     # Memory optimization parameters
     use_amp: bool = True  # Automatic Mixed Precision for memory efficiency
-    max_seq_len: int = 1024  # Reduced from 2048 for memory efficiency
-    d_model: int = 512  # Reduced from 768 for memory efficiency
-    n_heads: int = 8  # Reduced from 12 for memory efficiency
-    n_layers: int = 8  # Reduced from 12 for memory efficiency
-    d_ff: int = 2048  # Reduced from 3072 for memory efficiency
+    
+    # Data loading parameters
+    num_workers: int = 8
+    train_split: float = 0.9
+    seed: int = 42
+    
+    # Logging and checkpointing parameters
+    log_every: int = 200
+    validate_every_steps: int = 4000
+    checkpoint_every_steps: int = 20000
+    
+    # Debug and analysis parameters
+    print_timeline_stats: bool = False
+    print_random_timeline: bool = False
     
     # Tokenization parameters
     max_age_tokens: int = 20  # Age intervals (0-5, 5-10, etc.)

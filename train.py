@@ -18,6 +18,19 @@ from config import model_config
 from data_loader import PHTDataProcessor, analyze_data_distribution, PHTDataLoader
 from model import create_ethos_model, ETHOSTransformer
 
+def load_config(config_file: str = None):
+    """Load configuration from file or use default config"""
+    if config_file and os.path.exists(config_file):
+        # Load custom config file
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("custom_config", config_file)
+        custom_config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(custom_config_module)
+        return custom_config_module.model_config
+    else:
+        # Use default config from config.py
+        return model_config
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -432,21 +445,9 @@ def main():
     """Main training function"""
     parser = argparse.ArgumentParser(description='Train ETHOS Transformer Model')
     parser.add_argument('--data_dir', type=str, default='processed_data', help='Directory containing processed data (default: processed_data/)')
-    parser.add_argument('--tag', type=str, default=None,   help='Dataset tag to use (e.g., aou, mimic)')
-    parser.add_argument('--batch_size', type=int, default=8,  help='Training batch size per process (default: 8)')
-    parser.add_argument('--max_epochs', type=int, default=100,  help='Maximum training epochs (default: 100)')
-    parser.add_argument('--learning_rate', type=float, default=3e-4,  help='Learning rate (default: 3e-4)')
-    parser.add_argument('--device', type=str, default='auto',  choices=['auto', 'cuda', 'cpu'], help='Device to use (default: auto)')
-    parser.add_argument('--max_seq_len', type=int, default=1024, help='Max sequence length per sample (default: 1024)')
-    parser.add_argument('--grad_accum_steps', type=int, default=model_config.grad_accum_steps, help=f'Gradient accumulation steps (default: {model_config.grad_accum_steps})')
-    parser.add_argument('--warmup_steps', type=int, default=2000, help='LR warmup steps before cosine decay (default: 2000)')
-    parser.add_argument('--log_every', type=int, default=200, help='Steps between loss logs (default: 200)')
-    parser.add_argument('--num_workers', type=int, default=8, help='DataLoader workers (default: 8)')
-    parser.add_argument('--validate_every_steps', type=int, default=4000, help='Run validation every N optimizer steps (default: 4000). Set 0 to disable step-based validation.')
-    parser.add_argument('--checkpoint_every_steps', type=int, default=20000, help='Save a snapshot checkpoint every N optimizer steps (default: 20000). Set 0 to disable step snapshots.')
-    parser.add_argument('--print_timeline_stats', action='store_true', help='Print train/val patient counts and training timeline length histogram before training')
-    parser.add_argument('--print_random_timeline', action='store_true', help='Print a random patient timeline (decoded tokens) before training')
+    parser.add_argument('--tag', type=str, default=None, help='Dataset tag to use (e.g., aou, mimic)')
     parser.add_argument('--count_tokens', action='store_true', help='Count total tokens in training set and print to terminal, then exit')
+    parser.add_argument('--config_file', type=str, default=None, help='Path to a custom config file (default: config.py)')
 
     args = parser.parse_args()
 
@@ -475,9 +476,12 @@ def main():
     print(f"📁 Data directory: {args.data_dir}")
     if args.tag:
         print(f"🏷️  Dataset tag: {args.tag}")
-    print(f"⚙️  Batch size (per process): {args.batch_size}")
-    print(f"📈 Max epochs: {args.max_epochs}")
-    print(f"📚 Learning rate: {args.learning_rate}")
+    
+    # Load configuration
+    model_config = load_config(args.config_file)
+    print(f"⚙️  Batch size (per process): {model_config.batch_size}")
+    print(f"📈 Max epochs: {model_config.max_epochs}")
+    print(f"📚 Learning rate: {model_config.learning_rate}")
     
     # Set device
     if args.device == 'auto':
@@ -494,9 +498,11 @@ def main():
         except Exception:
             pass
     
-    # Auto-enable AMP on CUDA if user didn't specify flag
-    if device.type == 'cuda' and not hasattr(args, 'use_amp'): 
-        args.use_amp = model_config.use_amp
+    # Auto-enable AMP on CUDA
+    if device.type == 'cuda': 
+        use_amp = model_config.use_amp
+    else:
+        use_amp = False
     
     # Load data
     print("\n📊 Loading data...")
@@ -505,7 +511,7 @@ def main():
         print(f"✅ Loaded {len(tokenized_timelines)} patient timelines")
         print(f"📚 Vocabulary size: {len(vocab)}")
         # Optionally print a random patient timeline
-        if args.print_random_timeline and tokenized_timelines:
+        if model_config.print_random_timeline and tokenized_timelines:
             import random
             id_to_token = {v: k for k, v in vocab.items()}
             # Prefer longer timelines (>100 tokens); fallback to the longest available
@@ -534,11 +540,11 @@ def main():
     # Create data loaders
     print("\n🔧 Creating data loaders...")
     try:
-        data_processor = PHTDataProcessor(tokenized_timelines, len(vocab), train_split=0.9, seed=42)
+        data_processor = PHTDataProcessor(tokenized_timelines, len(vocab), train_split=model_config.train_split, seed=model_config.seed)
         # Respect max_seq_len from args
-        train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=args.max_seq_len)
+        train_dataset, val_dataset = data_processor.create_datasets(max_seq_len=model_config.max_seq_len)
         # Optional stats before loader creation
-        if args.print_timeline_stats:
+        if model_config.print_timeline_stats:
             def _count_bucket(n: int) -> str:
                 if n <= 10:
                     return '0-10'
@@ -564,8 +570,8 @@ def main():
             for k in ['0-10','10-20','20-100','100-200','200-800','>800']:
                 print(f"    {k}: {buckets[k]}")
 
-        train_loader = PHTDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
-        val_loader = PHTDataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+        train_loader = PHTDataLoader(train_dataset, batch_size=model_config.batch_size, shuffle=True, num_workers=model_config.num_workers, drop_last=True)
+        val_loader = PHTDataLoader(val_dataset, batch_size=model_config.batch_size, shuffle=False, num_workers=model_config.num_workers, drop_last=False)
         print(f"✅ Training batches: {len(train_loader)}")
         print(f"✅ Validation batches: {len(val_loader)}")
     except Exception as e:
@@ -590,7 +596,7 @@ def main():
             n_heads=model_config.n_heads,
             n_layers=model_config.n_layers,
             d_ff=model_config.d_ff,
-            max_seq_len=args.max_seq_len,
+            max_seq_len=model_config.max_seq_len,
             dropout=model_config.dropout,
         )
         model = model.to(device)
@@ -611,7 +617,7 @@ def main():
                     n_heads=6,
                     n_layers=6,
                     d_ff=1536,
-                    max_seq_len=args.max_seq_len,
+                    max_seq_len=model_config.max_seq_len,
                     dropout=model_config.dropout,
                 ).to(device)
                 try:
@@ -631,15 +637,15 @@ def main():
     
 
     trainer_config = {
-        'learning_rate': args.learning_rate,
-        'max_epochs': args.max_epochs,
+        'learning_rate': model_config.learning_rate,
+        'max_epochs': model_config.max_epochs,
         'gradient_clip': model_config.gradient_clip,
-        'use_amp': args.use_amp,
-        'grad_accum_steps': args.grad_accum_steps,
-        'warmup_steps': args.warmup_steps,
-        'log_every': args.log_every,
-        'validate_every_steps': args.validate_every_steps,
-        'checkpoint_every_steps': args.checkpoint_every_steps,
+        'use_amp': use_amp,
+        'grad_accum_steps': model_config.grad_accum_steps,
+        'warmup_steps': model_config.warmup_steps,
+        'log_every': model_config.log_every,
+        'validate_every_steps': model_config.validate_every_steps,
+        'checkpoint_every_steps': model_config.checkpoint_every_steps,
     }
 
     model_dir = os.path.join('models', args.tag) if args.tag else 'models'
