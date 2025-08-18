@@ -98,27 +98,16 @@ def main():
     ap.add_argument('--data_dir', required=True, help='Processed data directory (with tokenization.yaml, vocabulary.pkl, tokenized_timelines.pkl)')
     ap.add_argument('--out_dir', default=None, help='Output directory (default: <data_dir>_rf)')
     ap.add_argument('--min_count', type=int, default=0, help='Drop tokens with total count < min_count (from spec)')
-    target = ap.add_argument_group('Target options')
-    target.add_argument('--target_token', type=str, default=None, help='Target token name, e.g., CONDITION_OCCURRENCE_201826')
-    target.add_argument('--target_concept_id', type=int, default=None, help='Target concept_id; all tokens in spec with this concept_id will be considered')
+    ap.add_argument('--target_concept_id', type=int, default=None, help='Target concept_id; all tokens in spec with this concept_id will be removed and added to y')
     args = ap.parse_args()
 
     out_dir = args.out_dir or f"{args.data_dir.rstrip(os.sep)}_rf"
     os.makedirs(out_dir, exist_ok=True)
 
     vocab, tokenized_timelines, spec = load_processed(args.data_dir)
-    id_to_token = {tid: name for name, tid in vocab.items()}
 
     # Derive target token name(s)
-    target_tokens: List[str] = []
-    if args.target_token:
-        target_tokens = [args.target_token.strip()]
-    elif args.target_concept_id is not None:
-        target_tokens = expand_variants_from_concept_id(spec, int(args.target_concept_id))
-    else:
-        raise ValueError('Provide either --target_token or --target_concept_id')
-    if not target_tokens:
-        raise ValueError('Could not resolve any target tokens from the provided arguments')
+    target_tokens = expand_variants_from_concept_id(spec, int(args.target_concept_id))
 
     # Build feature set from spec concepts ordered by count desc
     print("Building feature set from concepts...")
@@ -159,7 +148,7 @@ def main():
     # Target id set (by name(s))
     target_id_set = {token_name_to_id[tok] for tok in target_tokens if tok in token_name_to_id}
     if not target_id_set:
-        raise ValueError('Resolved target tokens are not present in vocabulary')
+        raise ValueError('Resolved target token(s) are not present in vocabulary')
 
     # Build X and y
     patient_ids = sorted(tokenized_timelines.keys())
