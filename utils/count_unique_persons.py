@@ -33,9 +33,10 @@ def _tables_to_scan() -> List[str]:
 
 def _has_any_parquet(dir_path: str) -> bool:
     try:
-        for fn in os.listdir(dir_path):
-            if fn.endswith(".parquet"):
-                return True
+        for root, _dirs, files in os.walk(dir_path):
+            for fn in files:
+                if fn.endswith(".parquet"):
+                    return True
     except FileNotFoundError:
         return False
     return False
@@ -51,11 +52,23 @@ def _collect_person_ids_polars(dataset_dir: str, tables: List[str]) -> (Set[int]
         table_dir = os.path.join(dataset_dir, table)
         if not os.path.isdir(table_dir) or not _has_any_parquet(table_dir):
             continue
-        pattern = os.path.join(table_dir, "*.parquet")
-        try:
-            scan = pl.scan_parquet(pattern)
-            names = scan.collect_schema().names()
-        except Exception:
+        # Try direct parquet files, then recursive pattern for partitioned data
+        patterns = [
+            os.path.join(table_dir, "*.parquet"),
+            os.path.join(table_dir, "**", "*.parquet"),
+        ]
+        scan = None
+        names = []
+        for pattern in patterns:
+            try:
+                tmp = pl.scan_parquet(pattern)
+                names = tmp.collect_schema().names()
+                scan = tmp
+                if names:
+                    break
+            except Exception:
+                continue
+        if scan is None or not names:
             continue
         if "person_id" not in names:
             continue
@@ -98,12 +111,14 @@ def _collect_person_ids_arrow(dataset_dir: str, tables: List[str]) -> (Set[int],
         if not os.path.isdir(table_dir) or not _has_any_parquet(table_dir):
             continue
         if use_arrow:
+            # Use recursive discovery to handle partitioned subfolders
             try:
-                dataset = ds.dataset(table_dir, format="parquet")
+                dataset = ds.dataset(table_dir, format="parquet", partitioning="hive")
                 schema = dataset.schema
                 if "person_id" not in [f.name for f in schema]:
                     continue
-                t = dataset.to_table(columns=["person_id"])  # only read one column
+                # Scan only person_id
+                t = dataset.to_table(columns=["person_id"])
                 ids = set(t.column(0).to_pylist())
             except Exception:
                 ids = set()
@@ -112,15 +127,16 @@ def _collect_person_ids_arrow(dataset_dir: str, tables: List[str]) -> (Set[int],
             try:
                 import pandas as pd
                 ids = set()
-                for fn in os.listdir(table_dir):
-                    if not fn.endswith(".parquet"):
-                        continue
-                    fp = os.path.join(table_dir, fn)
-                    try:
-                        df = pd.read_parquet(fp, columns=["person_id"])  # type: ignore[arg-type]
-                        ids.update(df["person_id"].dropna().astype("int64").unique().tolist())
-                    except Exception:
-                        continue
+                for root, _dirs, files in os.walk(table_dir):
+                    for fn in files:
+                        if not fn.endswith(".parquet"):
+                            continue
+                        fp = os.path.join(root, fn)
+                        try:
+                            df = pd.read_parquet(fp, columns=["person_id"])  # type: ignore[arg-type]
+                            ids.update(df["person_id"].dropna().astype("int64").unique().tolist())
+                        except Exception:
+                            continue
             except Exception:
                 ids = set()
 
