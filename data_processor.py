@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 class OMOPDataProcessor:
     """Process large OMOP datasets with memory optimization"""
     
-    def __init__(self, data_path: str = None, engine: str = None, num_workers: int = None):
+    def __init__(self, data_path: str = None, engine: str = None, num_workers: int = None,
+                 include_person_ids: Optional[set] = None,
+                 override_vocab: Optional[Dict[str, int]] = None,
+                 override_quantiles: Optional[Dict[str, Any]] = None):
         self.vocab = {}
         self.vocab_size = 0
         self.quantile_mappings = {}
@@ -79,6 +82,10 @@ class OMOPDataProcessor:
         
         # Derived paths
         self.events_dir = os.path.join(data_config.output_dir, 'events_partitioned')
+        # Optional person filter and tokenization overrides
+        self.include_person_ids = set(include_person_ids) if include_person_ids else None
+        self.override_vocab = override_vocab
+        self.override_quantiles = override_quantiles
     
         # Event type mappings to table-inclusive prefixes
         # Examples: CONDITION_OCCURRENCE_123, DRUG_EXPOSURE_456, PROCEDURE_OCCURRENCE_789
@@ -329,6 +336,13 @@ class OMOPDataProcessor:
                   .select(["person_id", "ts", "et", "cid", "value_as_number", "unit_concept_id",
                            'cond_status','drug_route','value_as_concept_id','obs_type','proc_type',
                            "pid_bucket"]))
+        # Optional person filter
+        if self.include_person_ids:
+            try:
+                events = events.filter(pl.col("person_id").is_in(list(self.include_person_ids)))
+            except Exception:
+                ids_df = pl.DataFrame({"person_id": list(self.include_person_ids)})
+                events = events.join(ids_df.lazy(), on="person_id", how="inner")
         return events
     
     def _write_events_partitioned(self, events_lazy: 'pl.LazyFrame') -> None:
@@ -377,6 +391,8 @@ class OMOPDataProcessor:
         base_scan = pl.scan_parquet(path)
         names = base_scan.collect_schema().names()
         lf = base_scan.select([c for c in cols if c in names])
+        if self.include_person_ids:
+            lf = lf.filter(pl.col("person_id").is_in(list(self.include_person_ids)))
         if "birth_datetime" in names:
             lf = lf.with_columns(pl.col("birth_datetime").cast(pl.Datetime("ns")))
         df = lf.collect()
@@ -530,68 +546,79 @@ class OMOPDataProcessor:
         # Create mappings
         concept_counts, quantiles = self._compute_stats_polars(events)
         self.concept_counts = concept_counts
-        # If quantiles already provided (e.g., from a tokenization spec), keep them
-        if not self.quantile_mappings:
-            self.quantile_mappings = quantiles
+        # Quantiles and vocab handling
+        if self.override_quantiles is not None:
+            try:
+                self.quantile_mappings = {str(k): (np.array(v) if not isinstance(v, np.ndarray) else v) for k, v in self.override_quantiles.items()}
+            except Exception:
+                self.quantile_mappings = {str(k): np.array(v, dtype=float) for k, v in self.override_quantiles.items()}
+            logger.info("[FAST] Using provided quantile mappings (override)")
         else:
-            logger.info("[FAST] Using quantile mappings from provided spec; skipping recomputed quantiles")
+            if not self.quantile_mappings:
+                self.quantile_mappings = quantiles
+            else:
+                logger.info("[FAST] Using quantile mappings from provided spec; skipping recomputed quantiles")
         self.create_age_mappings()
         self.create_time_interval_mappings()
-        # Build vocabulary using counts
-        logger.info("[FAST] Building vocabulary from concept frequencies...")
-        # Base tokens
-        self.vocab[token_config.pad_token] = 0
-        self.vocab[token_config.unk_token] = 1
-        self.vocab[token_config.eos_token] = 2
-        self.vocab[token_config.sos_token] = 3
-        for et in ["admission","discharge","condition","medication","procedure","measurement","observation","death"]:
-            self.vocab[f"EVENT_{et.upper()}"] = len(self.vocab)
-        for age_interval in self.age_mappings.keys():
-            self.vocab[f"AGE_{age_interval}"] = len(self.vocab)
-        for time_interval in self.time_interval_mappings.keys():
-            self.vocab[f"TIME_{time_interval}"] = len(self.vocab)
-        for i in range(model_config.max_quantile_tokens):
-            self.vocab[f"Q{i}"] = len(self.vocab)
-        # Demographic tokens (from person_data)
-        genders = set()
-        races = set()
-        year_intervals = set()
-        for p in person_data.values():
-            g = p.get('gender_concept_id')
-            r = p.get('race_concept_id')
-            by = p.get('birth_year')
-            if g is not None:
-                genders.add(str(g))
-            if r is not None:
-                races.add(str(r))
-            if by is not None:
-                yi = self._get_year_interval(by)
-                year_intervals.add(yi)
-        for g in sorted(genders):
-            self.vocab[f"GENDER_{g}"] = len(self.vocab)
-        for r in sorted(races):
-            self.vocab[f"RACE_{r}"] = len(self.vocab)
-        for yi in sorted(year_intervals):
-            self.vocab[f"YEAR_{yi}"] = len(self.vocab)
-        # Unit tokens present in events
-        try:
-            units_df = (events
-                        .select(pl.col("unit_concept_id"))
-                        .drop_nulls()
-                        .unique()
-                        .collect())
-            if units_df.height:
-                for u in units_df.get_column("unit_concept_id").to_list():
-                    self.vocab[f"UNIT_{int(u)}"] = len(self.vocab)
-        except Exception:
-            pass
-        # Add concept tokens up to capacity
-        max_concepts = model_config.vocab_size - len(self.vocab)
-        for concept, _n in concept_counts.most_common(max_concepts):
-            # concept already includes table suffix
-            self.vocab[concept] = len(self.vocab)
-        self.vocab_size = len(self.vocab)
-        logger.info(f"[FAST] Vocabulary size: {self.vocab_size}")
+        # Build or override vocabulary
+        if self.override_vocab is not None:
+            self.vocab = dict(self.override_vocab)
+            self.vocab_size = len(self.vocab)
+            logger.info(f"[FAST] Using provided vocabulary (size={self.vocab_size})")
+        else:
+            logger.info("[FAST] Building vocabulary from concept frequencies...")
+            # Base tokens
+            self.vocab[token_config.pad_token] = 0
+            self.vocab[token_config.unk_token] = 1
+            self.vocab[token_config.eos_token] = 2
+            self.vocab[token_config.sos_token] = 3
+            for et in ["admission","discharge","condition","medication","procedure","measurement","observation","death"]:
+                self.vocab[f"EVENT_{et.upper()}"] = len(self.vocab)
+            for age_interval in self.age_mappings.keys():
+                self.vocab[f"AGE_{age_interval}"] = len(self.vocab)
+            for time_interval in self.time_interval_mappings.keys():
+                self.vocab[f"TIME_{time_interval}"] = len(self.vocab)
+            for i in range(model_config.max_quantile_tokens):
+                self.vocab[f"Q{i}"] = len(self.vocab)
+            # Demographic tokens (from person_data)
+            genders = set()
+            races = set()
+            year_intervals = set()
+            for p in person_data.values():
+                g = p.get('gender_concept_id')
+                r = p.get('race_concept_id')
+                by = p.get('birth_year')
+                if g is not None:
+                    genders.add(str(g))
+                if r is not None:
+                    races.add(str(r))
+                if by is not None:
+                    yi = self._get_year_interval(by)
+                    year_intervals.add(yi)
+            for g in sorted(genders):
+                self.vocab[f"GENDER_{g}"] = len(self.vocab)
+            for r in sorted(races):
+                self.vocab[f"RACE_{r}"] = len(self.vocab)
+            for yi in sorted(year_intervals):
+                self.vocab[f"YEAR_{yi}"] = len(self.vocab)
+            # Unit tokens present in events
+            try:
+                units_df = (events
+                            .select(pl.col("unit_concept_id"))
+                            .drop_nulls()
+                            .unique()
+                            .collect())
+                if units_df.height:
+                    for u in units_df.get_column("unit_concept_id").to_list():
+                        self.vocab[f"UNIT_{int(u)}"] = len(self.vocab)
+            except Exception:
+                pass
+            # Add concept tokens up to capacity
+            max_concepts = model_config.vocab_size - len(self.vocab)
+            for concept, _n in concept_counts.most_common(max_concepts):
+                self.vocab[concept] = len(self.vocab)
+            self.vocab_size = len(self.vocab)
+            logger.info(f"[FAST] Vocabulary size: {self.vocab_size}")
         # Tokenize from partitions
         tokenized_timelines = self._tokenize_from_partitions(person_data)
         # Save
@@ -1034,6 +1061,8 @@ class OMOPDataProcessor:
             
             for _, person in chunk.iterrows():
                 person_id = person['person_id']
+                if self.include_person_ids and person_id not in self.include_person_ids:
+                    continue
                 person_data[person_id] = {
                     'gender_concept_id': person.get('gender_concept_id'),
                     'race_concept_id': person.get('race_concept_id'),
@@ -1690,11 +1719,23 @@ class OMOPDataProcessor:
             procedure_timelines, measurement_timelines, observation_timelines, death_timelines
         )
         # Step 4: Create mappings
-        self.create_quantile_mappings(patient_timelines)
+        if self.override_quantiles is not None:
+            try:
+                self.quantile_mappings = {str(k): (np.array(v) if not isinstance(v, np.ndarray) else v) for k, v in self.override_quantiles.items()}
+            except Exception:
+                self.quantile_mappings = {str(k): np.array(v, dtype=float) for k, v in self.override_quantiles.items()}
+            logger.info("Using provided quantile mappings (override)")
+        else:
+            self.create_quantile_mappings(patient_timelines)
         self.create_age_mappings()
         self.create_time_interval_mappings()
-        # Step 5: Build vocabulary
-        self.build_vocabulary(patient_timelines)
+        # Step 5: Build or override vocabulary
+        if self.override_vocab is not None:
+            self.vocab = dict(self.override_vocab)
+            self.vocab_size = len(self.vocab)
+            logger.info(f"Using provided vocabulary (size={self.vocab_size})")
+        else:
+            self.build_vocabulary(patient_timelines)
         # Step 6: Tokenize timelines (in chunks to manage memory)
         tokenized_timelines = {}
         patient_ids = list(patient_timelines.keys())
@@ -1805,6 +1846,12 @@ def main():
                        help='Path to tokenization.yaml from train split; if provided, reuse its vocabulary and quantile cid set')
     parser.add_argument('--num_workers', type=int, default=None,
                        help='Number of workers for parallel steps (default: CPU cores - 1)')
+    parser.add_argument('--split_by_person', action='store_true',
+                       help='Split dataset by person_id into train/test and process both')
+    parser.add_argument('--train_frac', type=float, default=0.7,
+                       help='Fraction of persons for training (default: 0.7)')
+    parser.add_argument('--split_seed', type=int, default=None,
+                       help='Random seed for the person split (defaults to model_config.seed)')
 
     args = parser.parse_args()
     
@@ -1818,12 +1865,76 @@ def main():
     if args.memory_limit:
         data_config.memory_limit_gb = args.memory_limit
     
-    # Create output directory
+    # Create output directory (base root)
     os.makedirs(data_config.output_dir, exist_ok=True)
     
     # Initialize processor with custom data path and engine
     processor = OMOPDataProcessor(data_path=args.data_path, engine=args.engine, num_workers=args.num_workers)
     
+    # If splitting by person_id, run the split workflow and exit
+    if args.split_by_person:
+        base_output_root = data_config.output_dir
+        os.makedirs(base_output_root, exist_ok=True)
+        # Load all person IDs using the chosen engine
+        loader = OMOPDataProcessor(data_path=args.data_path, engine=args.engine, num_workers=args.num_workers)
+        if loader.engine == 'polars' and pl is not None:
+            all_person_data = loader._load_person_static_pl()
+            all_ids = list(all_person_data.keys())
+        else:
+            pdict = loader.process_person_table()
+            all_ids = list(pdict.keys())
+        if not all_ids:
+            logger.error("No person IDs found to split")
+            return
+        rng = np.random.RandomState(args.split_seed if args.split_seed is not None else model_config.seed)
+        rng.shuffle(all_ids)
+        cutoff = int(len(all_ids) * max(0.0, min(1.0, args.train_frac)))
+        train_ids = all_ids[:cutoff]
+        test_ids = all_ids[cutoff:]
+        logger.info(f"Split {len(all_ids)} persons -> train={len(train_ids)}, test={len(test_ids)}")
+        # Save split IDs
+        splits_dir = os.path.join(base_output_root, 'splits')
+        os.makedirs(splits_dir, exist_ok=True)
+        with open(os.path.join(splits_dir, 'train_person_ids.txt'), 'w') as f:
+            for pid in train_ids:
+                f.write(f"{pid}\n")
+        with open(os.path.join(splits_dir, 'test_person_ids.txt'), 'w') as f:
+            for pid in test_ids:
+                f.write(f"{pid}\n")
+        # Process train split
+        train_out_dir = os.path.join(base_output_root, 'train')
+        os.makedirs(train_out_dir, exist_ok=True)
+        data_config.output_dir = train_out_dir
+        processor_train = OMOPDataProcessor(data_path=args.data_path, engine=args.engine, num_workers=args.num_workers,
+                                            include_person_ids=set(train_ids))
+        tokenized_timelines_train, vocab_train = processor_train.process_all_data()
+        # Process test split with train tokenization spec
+        train_spec_path = os.path.join(train_out_dir, 'tokenization.yaml')
+        spec_vocab: Optional[Dict[str,int]] = None
+        spec_quantiles: Optional[Dict[str, List[float]]] = None
+        try:
+            with open(train_spec_path, 'r') as f:
+                spec = yaml.safe_load(f)
+            vocab_list = spec.get('vocabulary', [])
+            spec_vocab = {tok: idx for idx, tok in enumerate(vocab_list)}
+            spec_quantiles = spec.get('quantile_mappings', None)
+            logger.info(f"Loaded train tokenization spec: {len(spec_vocab)} vocab tokens, quantiles for {len(spec_quantiles or {})} cids")
+        except Exception as e:
+            logger.warning(f"Could not load train tokenization spec from {train_spec_path}: {e}")
+            spec_vocab = None
+            spec_quantiles = None
+        test_out_dir = os.path.join(base_output_root, 'test')
+        os.makedirs(test_out_dir, exist_ok=True)
+        data_config.output_dir = test_out_dir
+        processor_test = OMOPDataProcessor(data_path=args.data_path, engine=args.engine, num_workers=args.num_workers,
+                                           include_person_ids=set(test_ids),
+                                           override_vocab=spec_vocab,
+                                           override_quantiles=spec_quantiles)
+        tokenized_timelines_test, vocab_test = processor_test.process_all_data()
+        print(f"Processed train/test splits. Train patients: {len(tokenized_timelines_train)}, Test patients: {len(tokenized_timelines_test)}")
+        print(f"Train dir: {train_out_dir}\nTest dir: {test_out_dir}")
+        return
+
     # Check if we should reprocess
     should_reprocess = args.force_reprocess
     
