@@ -147,6 +147,7 @@ def count_unique_persons(dataset_dir: str) -> (int, Optional[int]):
 
 def main(argv: List[str]) -> int:
     import argparse
+    from tqdm import tqdm
 
     default_dirs = [
         "./utils/omop_data_2022",
@@ -160,7 +161,7 @@ def main(argv: List[str]) -> int:
     parser.add_argument("data_dirs", nargs="*", default=default_dirs, help="OMOP dataset directories")
     args = parser.parse_args(argv)
 
-    for d in args.data_dirs:
+    for d in tqdm(args.data_dirs, desc="Datasets", unit="dir"):
         if not os.path.isdir(d):
             print(f"{d}: directory not found")
             continue
