@@ -1,6 +1,5 @@
 """
-Configuration file for ETHOS-like transformer model for EHR data
-Optimized for large OMOP datasets
+Configuration file for training transformer model for EHR data
 """
 
 import os

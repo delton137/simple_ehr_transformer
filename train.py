@@ -311,6 +311,8 @@ class ETHOSTrainer:
             best_with_step_fp = os.path.join(self.model_dir, f"best_checkpoint_step_{self.global_step:07d}.pth")
             torch.save(checkpoint, best_with_step_fp)
             logger.info(f"Saved best checkpoint with validation loss: {self.best_val_loss:.4f} ({best_with_step_fp})")
+        # Prune old checkpoints (keep latest 5 saved *.pth, excluding the rolling latest_checkpoint.pth)
+        self._prune_old_checkpoints(keep=5)
 
     def save_step_checkpoint(self, step: int):
         """Save a snapshot checkpoint with step number to allow caching."""
@@ -329,6 +331,38 @@ class ETHOSTrainer:
         filename = os.path.join(self.model_dir, f'checkpoint_step_{step:07d}.pth')
         torch.save(checkpoint, filename)
         logger.info(f"Saved step checkpoint: {filename}")
+        # Prune old checkpoints (keep latest 5 saved *.pth, excluding the rolling latest_checkpoint.pth)
+        self._prune_old_checkpoints(keep=5)
+
+    def _prune_old_checkpoints(self, keep: int = 5):
+        """Keep only the most recent 'keep' checkpoint files (excluding latest_checkpoint.pth)."""
+        try:
+            files = [
+                f for f in os.listdir(self.model_dir)
+                if f.endswith('.pth') and f != 'latest_checkpoint.pth'
+            ]
+            if len(files) <= keep:
+                return
+            files_with_mtime = []
+            for f in files:
+                fp = os.path.join(self.model_dir, f)
+                try:
+                    mtime = os.path.getmtime(fp)
+                except Exception:
+                    mtime = 0.0
+                files_with_mtime.append((mtime, fp))
+            # Sort by most recent first
+            files_with_mtime.sort(key=lambda x: x[0], reverse=True)
+            to_keep = set(fp for _, fp in files_with_mtime[:keep])
+            to_delete = [fp for _, fp in files_with_mtime[keep:]]
+            for fp in to_delete:
+                try:
+                    os.remove(fp)
+                    logger.info(f"Pruned old checkpoint: {fp}")
+                except Exception as e:
+                    logger.warning(f"Could not remove old checkpoint {fp}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to prune old checkpoints: {e}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
