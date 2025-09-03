@@ -1519,7 +1519,7 @@ class OMOPDataProcessor:
             tokens.extend(event_tokens)
         
         # Add end of sequence token
-        tokens.append(self.vocab.get(token_config.eos_token, 0))
+        tokens.append(self.vocab.get(token_config.eos_token, self.vocab.get(token_config.unk_token, 1)))
         
         return tokens
     
@@ -1529,23 +1529,24 @@ class OMOPDataProcessor:
         
         # Age token
         age_interval = self._get_age_interval(patient_age)
-        age_token = self.vocab.get(f"AGE_{age_interval}", 0)
+        unk_id = self.vocab.get(token_config.unk_token, 1)
+        age_token = self.vocab.get(f"AGE_{age_interval}", unk_id)
         tokens.append(age_token)
         
         # Gender token
         gender = static_event.get('gender', 'unknown')
-        gender_token = self.vocab.get(f"GENDER_{gender}", 0)
+        gender_token = self.vocab.get(f"GENDER_{gender}", unk_id)
         tokens.append(gender_token)
         
         # Race token
         race = static_event.get('race', 'unknown')
-        race_token = self.vocab.get(f"RACE_{race}", 0)
+        race_token = self.vocab.get(f"RACE_{race}", unk_id)
         tokens.append(race_token)
         
         # Birth year token
         birth_year = static_event.get('birth_year', 1970)
         year_interval = self._get_year_interval(birth_year)
-        year_token = self.vocab.get(f"YEAR_{year_interval}", 0)
+        year_token = self.vocab.get(f"YEAR_{year_interval}", unk_id)
         tokens.append(year_token)
         
         return tokens
@@ -1556,53 +1557,54 @@ class OMOPDataProcessor:
         event_type = event['event_type']
         
         # Event type token
-        type_token = self.vocab.get(f"EVENT_{event_type.upper()}", 0)
+        unk_id = self.vocab.get(token_config.unk_token, 1)
+        type_token = self.vocab.get(f"EVENT_{event_type.upper()}", unk_id)
         tokens.append(type_token)
         
         # Event-specific tokens
         if event_type == 'admission':
             visit_type = event.get('visit_type', 'unknown')
-            tokens.append(self.vocab.get(f"VISIT_TYPE_{visit_type}", 0))
+            tokens.append(self.vocab.get(f"VISIT_TYPE_{visit_type}", unk_id))
             
         elif event_type == 'condition':
             concept_id = event.get('condition_concept_id', 'unknown')
             pref = self.event_type_prefix.get('condition', 'CONDITION_')
             token_key = f"{pref}{concept_id}"
-            tokens.append(self.vocab.get(token_key, 0))
+            tokens.append(self.vocab.get(token_key, unk_id))
             
         elif event_type == 'medication':
             concept_id = event.get('drug_concept_id', 'unknown')
             pref = self.event_type_prefix.get('medication', 'DRUG_')
             token_key = f"{pref}{concept_id}"
-            tokens.append(self.vocab.get(token_key, 0))
+            tokens.append(self.vocab.get(token_key, unk_id))
             
         elif event_type == 'procedure':
             concept_id = event.get('procedure_concept_id', 'unknown')
             pref = self.event_type_prefix.get('procedure', 'PROCEDURE_')
             token_key = f"{pref}{concept_id}"
-            tokens.append(self.vocab.get(token_key, 0))
+            tokens.append(self.vocab.get(token_key, unk_id))
             
         elif event_type == 'measurement':
             concept_id = event.get('measurement_concept_id', 'unknown')
             pref = self.event_type_prefix.get('measurement', 'MEASUREMENT_')
             token_key = f"{pref}{concept_id}"
-            tokens.append(self.vocab.get(token_key, 0))
+            tokens.append(self.vocab.get(token_key, unk_id))
             
             # Value quantile token
             value = event.get('value_as_number')
             if pd.notna(value) and concept_id in self.quantile_mappings:
                 quantile = self._get_quantile(value, concept_id)
-                quantile_token = self.vocab.get(f"Q{quantile}", 0)
+                quantile_token = self.vocab.get(f"Q{quantile}", unk_id)
                 tokens.append(quantile_token)
             
             # Unit token
             unit = event.get('unit_concept_id', 'unknown')
-            tokens.append(self.vocab.get(f"UNIT_{unit}", 0))
+            tokens.append(self.vocab.get(f"UNIT_{unit}", unk_id))
         elif event_type == 'observation':
             concept_id = event.get('observation_concept_id', 'unknown')
             pref = self.event_type_prefix.get('observation', 'OBSERVATION_')
             token_key = f"{pref}{concept_id}"
-            tokens.append(self.vocab.get(token_key, 0))
+            tokens.append(self.vocab.get(token_key, unk_id))
         
         return tokens
     
