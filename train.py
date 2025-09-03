@@ -487,8 +487,8 @@ def main():
     # Favor less fragmentation on GPUs
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
-    # Handle tag-based data directory
-    if args.tag and not args.data_dir.startswith('processed_data_'):
+    # Handle tag-based data directory only if using default data_dir
+    if args.tag and args.data_dir == 'processed_data':
         args.data_dir = f"processed_data_{args.tag}"
     
     # Validate data directory
