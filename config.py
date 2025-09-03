@@ -20,14 +20,14 @@ class ModelConfig:
     
     # Training parameters
     batch_size: int = 4
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     warmup_steps: int = 4000
     max_epochs: int = 100
     gradient_clip: float = 1.0
     grad_accum_steps: int = 1  # Gradient accumulation steps for memory management (reduce to 1 if OOM, increase to 4+ for larger effective batch)
     
     # Memory optimization parameters
-    use_amp: bool = True  # Automatic Mixed Precision for memory efficiency
+    use_amp: bool = False  # Automatic Mixed Precision for memory efficiency
     
     # Data loading parameters
     num_workers: int = 8
