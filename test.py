@@ -535,7 +535,26 @@ def main() -> None:
         args.output_dir = os.path.dirname(args.model_path) or "."
 
     # Load current vocab and tokenized timelines
-    with open(os.path.join(args.current_data_dir, "vocabulary.pkl"), "rb") as f:
+    # Resolve vocabulary path preference:
+    # 1) vocabulary.pkl next to checkpoint
+    # 2) vocabulary.pkl in current_data_dir (fallback)
+    vocab_candidates = []
+    model_dir = os.path.dirname(args.model_path)
+    vocab_candidates.append(os.path.join(model_dir, "vocabulary.pkl"))
+    vocab_candidates.append(os.path.join(args.current_data_dir, "vocabulary.pkl"))
+
+    chosen_vocab_path: Optional[str] = None
+    for vp in vocab_candidates:
+        if vp and os.path.exists(vp):
+            chosen_vocab_path = vp
+            break
+
+    if chosen_vocab_path is None:
+        raise FileNotFoundError(
+            "Could not find a vocabulary.pkl. Place vocabulary.pkl next to the checkpoint, or ensure it exists in current_data_dir."
+        )
+
+    with open(chosen_vocab_path, "rb") as f:
         vocab: Dict[str, int] = pickle.load(f)
     with open(os.path.join(args.current_data_dir, "tokenized_timelines.pkl"), "rb") as f:
         current_tt: Dict[int, List[int]] = pickle.load(f)
@@ -544,7 +563,25 @@ def main() -> None:
     with open(os.path.join(args.future_data_dir, "tokenized_timelines.pkl"), "rb") as f:
         future_tt: Dict[int, List[int]] = pickle.load(f)
     # Load future vocabulary for correct decoding of future IDs
-    with open(os.path.join(args.future_data_dir, "vocabulary.pkl"), "rb") as f:
+    # Resolve future vocabulary path preference:
+    # 1) vocabulary.pkl next to checkpoint
+    # 2) vocabulary.pkl in future_data_dir (fallback)
+    future_vocab_candidates = []
+    future_vocab_candidates.append(os.path.join(model_dir, "vocabulary.pkl"))
+    future_vocab_candidates.append(os.path.join(args.future_data_dir, "vocabulary.pkl"))
+
+    chosen_future_vocab_path: Optional[str] = None
+    for vp in future_vocab_candidates:
+        if vp and os.path.exists(vp):
+            chosen_future_vocab_path = vp
+            break
+
+    if chosen_future_vocab_path is None:
+        raise FileNotFoundError(
+            "Could not find a vocabulary.pkl for future data. Place vocabulary.pkl next to the checkpoint, or ensure it exists in future_data_dir."
+        )
+
+    with open(chosen_future_vocab_path, "rb") as f:
         future_vocab: Dict[str, int] = pickle.load(f)
     id_to_token_future = {tid: name for name, tid in future_vocab.items()}
 
