@@ -465,6 +465,12 @@ class ETHOSTrainer:
         logger.info("Training completed!")
 
 
+def count_model_parameters(model):
+    """Count and return the total number of parameters in the model"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
+
 def load_processed_data(data_dir: str):
     """Load tokenized timelines and vocabulary pickles from data_dir."""
     import pickle
@@ -628,11 +634,9 @@ def main():
             dropout=model_config.dropout,
         )
         model = model.to(device)
-        try:
-            num_params = model.count_parameters()  # type: ignore[attr-defined]
-            print(f"✅ Model created with {num_params:,} parameters")
-        except Exception:
-            print("✅ Model created")
+        # Count and print model parameters
+        total_params, trainable_params = count_model_parameters(model)
+        print(f"✅ Model created with {total_params:,} total parameters ({trainable_params:,} trainable)")
     except RuntimeError as e:
         # Handle OOM at model init by retrying with a smaller config
         oom = ('out of memory' in str(e).lower())
@@ -648,11 +652,9 @@ def main():
                     max_seq_len=model_config.max_seq_len,
                     dropout=model_config.dropout,
                 ).to(device)
-                try:
-                    num_params = model.count_parameters()  # type: ignore[attr-defined]
-                    print(f"✅ Model created with {num_params:,} parameters (fallback)")
-                except Exception:
-                    print("✅ Model created (fallback)")
+                # Count and print model parameters for fallback model
+                total_params, trainable_params = count_model_parameters(model)
+                print(f"✅ Model created with {total_params:,} total parameters ({trainable_params:,} trainable) (fallback)")
             except Exception as ee:
                 print(f"❌ Error creating fallback model: {ee}")
                 return
