@@ -1,8 +1,3 @@
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init -)"
-eval "$(pyenv virtualenv-init -)"
-
 #TAG=aou_2021_2022
 #DATA_DIR=/home/jupyter/workspaces/ehrtransformerbaseline/omop_data_2021_2022
  
