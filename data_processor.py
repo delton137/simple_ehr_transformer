@@ -219,44 +219,13 @@ class OMOPDataProcessor:
     # =====================
     def _scan_table_pl(self, table: str, ts_col: str, et_str: str, cid_col: str,
                        val_col: Optional[str] = None, unit_col: Optional[str] = None) -> 'pl.LazyFrame':
-        # Support both flat and partitioned parquet layouts
-        table_dir = os.path.join(self.omop_data_dir, table)
-        patterns = [
-            os.path.join(table_dir, "*.parquet"),
-            os.path.join(table_dir, "**", "*.parquet"),
-        ]
-        base_scan = None
-        for pattern in patterns:
-            try:
-                tmp = pl.scan_parquet(pattern)
-                # Trigger schema resolution; if no sources, this will raise
-                _ = tmp.collect_schema().names()
-                base_scan = tmp
-                break
-            except Exception:
-                continue
-        # If no parquet files were found, return an empty frame with the expected schema
-        if base_scan is None:
-            logger.warning(f"[FAST] No parquet files found for table '{table}' in {table_dir}; returning empty frame")
-            empty_df = pl.DataFrame({
-                'person_id': pl.Series([], dtype=pl.Int64),
-                'ts': pl.Series([], dtype=pl.Datetime("ns")),
-                'et': pl.Series([], dtype=pl.Utf8),
-                'cid': pl.Series([], dtype=pl.Int64),
-                'value_as_number': pl.Series([], dtype=pl.Float64),
-                'unit_concept_id': pl.Series([], dtype=pl.Int64),
-                'cond_status': pl.Series([], dtype=pl.Int64),
-                'drug_route': pl.Series([], dtype=pl.Int64),
-                'value_as_concept_id': pl.Series([], dtype=pl.Int64),
-                'obs_type': pl.Series([], dtype=pl.Int64),
-                'proc_type': pl.Series([], dtype=pl.Int64),
-            })
-            return empty_df.lazy()
+        path = os.path.join(self.omop_data_dir, table, "*.parquet")
         cols = ["person_id", ts_col, cid_col]
         if val_col:
             cols.append(val_col)
         if unit_col:
             cols.append(unit_col)
+        base_scan = pl.scan_parquet(path)
         names = base_scan.collect_schema().names()
         # Determine timestamp source column; fallback to date if needed
         ts_source = ts_col if ts_col in names else DATE_FALLBACKS.get(table)
@@ -413,30 +382,14 @@ class OMOPDataProcessor:
             raise
     
     def _load_person_static_pl(self) -> Dict[int, Dict[str, Any]]:
-        person_dir = os.path.join(self.omop_data_dir, "person")
+        path = os.path.join(self.omop_data_dir, "person", "*.parquet")
         logger.info("[FAST] Loading person demographics (Polars)...")
         cols = [
             "person_id", "gender_concept_id", "race_concept_id", "ethnicity_concept_id",
             "birth_datetime", "death_datetime"
         ]
-        # Support flat and partitioned layouts; handle empty
-        patterns = [
-            os.path.join(person_dir, "*.parquet"),
-            os.path.join(person_dir, "**", "*.parquet"),
-        ]
-        base_scan = None
-        names: List[str] = []
-        for pattern in patterns:
-            try:
-                tmp = pl.scan_parquet(pattern)
-                names = tmp.collect_schema().names()
-                base_scan = tmp
-                break
-            except Exception:
-                continue
-        if base_scan is None:
-            logger.warning(f"[FAST] No parquet files found for table 'person' in {person_dir}; returning empty demographics")
-            return {}
+        base_scan = pl.scan_parquet(path)
+        names = base_scan.collect_schema().names()
         lf = base_scan.select([c for c in cols if c in names])
         if self.include_person_ids:
             lf = lf.filter(pl.col("person_id").is_in(list(self.include_person_ids)))
