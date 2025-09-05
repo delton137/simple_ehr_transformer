@@ -1933,6 +1933,7 @@ def main():
                                            override_vocab=spec_vocab,
                                            override_quantiles=spec_quantiles)
         tokenized_timelines_test, vocab_test = processor_test.process_all_data()
+
         print(f"Processed train/test splits. Train patients: {len(tokenized_timelines_train)}, Test patients: {len(tokenized_timelines_test)}")
         print(f"Train dir: {train_out_dir}\nTest dir: {test_out_dir}")
         return
@@ -2004,17 +2005,6 @@ def main():
     # Warn if still 0 patients
     if len(tokenized_timelines) == 0:
         print("\n⚠️  WARNING: No patients were processed!")
-        print("This could indicate:")
-        print("1. Data directory structure is incorrect")
-        print("2. Parquet files are empty or corrupted")
-        print("3. Column names don't match expected OMOP format")
-        print("\nTry running with --force_reprocess to see detailed logs")
-    
-    # Show tag information
-    if args.tag:
-        print(f"\n📁 Dataset tag: {args.tag}")
-        print(f"📁 Output directory: {data_config.output_dir}")
-        print(f"💡 To use this dataset in other scripts, use: --data_dir {data_config.output_dir}")
 
 if __name__ == "__main__":
     main()
