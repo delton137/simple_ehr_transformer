@@ -413,14 +413,30 @@ class OMOPDataProcessor:
             raise
     
     def _load_person_static_pl(self) -> Dict[int, Dict[str, Any]]:
-        path = os.path.join(self.omop_data_dir, "person", "*.parquet")
+        person_dir = os.path.join(self.omop_data_dir, "person")
         logger.info("[FAST] Loading person demographics (Polars)...")
         cols = [
             "person_id", "gender_concept_id", "race_concept_id", "ethnicity_concept_id",
             "birth_datetime", "death_datetime"
         ]
-        base_scan = pl.scan_parquet(path)
-        names = base_scan.collect_schema().names()
+        # Support flat and partitioned layouts; handle empty
+        patterns = [
+            os.path.join(person_dir, "*.parquet"),
+            os.path.join(person_dir, "**", "*.parquet"),
+        ]
+        base_scan = None
+        names: List[str] = []
+        for pattern in patterns:
+            try:
+                tmp = pl.scan_parquet(pattern)
+                names = tmp.collect_schema().names()
+                base_scan = tmp
+                break
+            except Exception:
+                continue
+        if base_scan is None:
+            logger.warning(f"[FAST] No parquet files found for table 'person' in {person_dir}; returning empty demographics")
+            return {}
         lf = base_scan.select([c for c in cols if c in names])
         if self.include_person_ids:
             lf = lf.filter(pl.col("person_id").is_in(list(self.include_person_ids)))
