@@ -1,1 +1,7 @@
-python data_processor_random_forest.py --data_dir  processed_data_aou_2021_2022/train --target_concept_id 201826 --train_days 365 --test_days 365
+python data_processor_random_forest.py \
+  --data_dir processed_data_aou_2021_2022/train \
+  --out_dir processed_data_aou_2021_2022/train_rf \
+  --test_data_dir processed_data_aou_2021_2022/test \
+  --test_out_dir processed_data_aou_2021_2022/test_rf \
+  --target_concept_id 201826 \
+  --train_days 365 --test_days 365 --sparse
