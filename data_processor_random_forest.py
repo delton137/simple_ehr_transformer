@@ -35,6 +35,7 @@ try:
 except Exception:
     sp = None
 from datetime import datetime, timedelta
+import pandas as pd
 
 
 CONCEPT_PREFIXES = (
@@ -74,15 +75,78 @@ def load_processed(data_dir: str):
     return vocab, patient_timelines, spec
 
 
-def load_patient_timelines_only(data_dir: str) -> Dict[int, List[dict]]:
-    """Load only patient_timelines.pkl from a processed data directory."""
+def build_timelines_from_events_partitioned(data_dir: str) -> Dict[int, List[dict]]:
+    """Reconstruct minimal timelines from events_partitioned parquet files.
+    Requires columns: person_id, ts, et, cid, value_as_number, unit_concept_id
+    """
+    base = os.path.join(data_dir, 'events_partitioned')
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"events_partitioned directory not found in {data_dir}")
+    from pathlib import Path
+    files = list(Path(base).rglob('*.parquet'))
+    timelines: Dict[int, List[dict]] = {}
+    for fp in tqdm(files, desc='Reconstructing timelines from events_partitioned', unit='file'):
+        try:
+            df = pd.read_parquet(str(fp))
+        except Exception:
+            continue
+        if df is None or len(df) == 0:
+            continue
+        required = [c for c in ['person_id','ts','et','cid','value_as_number','unit_concept_id'] if c in df.columns]
+        if not {'person_id','ts','et','cid'}.issubset(set(required)):
+            continue
+        df = df.sort_values(['person_id','ts'])
+        for pid, sub in df.groupby('person_id'):
+            pid = int(pid)
+            seq = timelines.get(pid, [])
+            for _, row in sub.iterrows():
+                ts = row.get('ts')
+                et = row.get('et')
+                cid = row.get('cid')
+                if ts is None or pd.isna(ts) or et is None or cid is None:
+                    continue
+                ev: Dict[str, object] = {'timestamp': ts, 'event_type': et}
+                if et == 'condition':
+                    ev['condition_concept_id'] = int(cid)
+                elif et == 'medication':
+                    ev['drug_concept_id'] = int(cid)
+                elif et == 'procedure':
+                    ev['procedure_concept_id'] = int(cid)
+                elif et == 'measurement':
+                    ev['measurement_concept_id'] = int(cid)
+                    if 'value_as_number' in df.columns:
+                        ev['value_as_number'] = row.get('value_as_number')
+                    if 'unit_concept_id' in df.columns:
+                        ev['unit_concept_id'] = row.get('unit_concept_id')
+                elif et == 'observation':
+                    ev['observation_concept_id'] = int(cid)
+                seq.append(ev)
+            if seq:
+                # ensure sorted
+                seq.sort(key=lambda e: e.get('timestamp'))
+                timelines[pid] = seq
+    return timelines
+
+
+def load_patient_timelines_only(data_dir: str, allow_events_fallback: bool = True) -> Dict[int, List[dict]]:
+    """Load patient_timelines.pkl; optionally fallback to events_partitioned if empty/missing."""
     pt_path = os.path.join(data_dir, 'patient_timelines.pkl')
-    if not os.path.exists(pt_path):
-        raise FileNotFoundError(f"Missing patient_timelines.pkl in {data_dir}")
-    print(f"Loading patient timelines from {data_dir}...")
-    with open(pt_path, 'rb') as f:
-        patient_timelines: Dict[int, List[dict]] = pickle.load(f)
-    return patient_timelines
+    timelines: Optional[Dict[int, List[dict]]] = None
+    if os.path.exists(pt_path):
+        try:
+            print(f"Loading patient timelines from {data_dir}...")
+            with open(pt_path, 'rb') as f:
+                timelines = pickle.load(f)
+            if not isinstance(timelines, dict) or len(timelines) == 0:
+                timelines = None
+        except Exception:
+            timelines = None
+    if timelines is None and allow_events_fallback:
+        print("patient_timelines.pkl missing or empty; falling back to events_partitioned reconstruction...")
+        timelines = build_timelines_from_events_partitioned(data_dir)
+    if timelines is None:
+        raise FileNotFoundError(f"Could not load timelines from {data_dir}")
+    return timelines
 
 
 def feature_tokens_from_spec(spec: dict, min_count: int = 0) -> List[Tuple[str, int]]:
@@ -373,7 +437,7 @@ def main():
     if args.test_data_dir:
         test_out_dir = args.test_out_dir or f"{args.test_data_dir.rstrip(os.sep)}_rf"
         os.makedirs(test_out_dir, exist_ok=True)
-        test_timelines = load_patient_timelines_only(args.test_data_dir)
+        test_timelines = load_patient_timelines_only(args.test_data_dir, allow_events_fallback=True)
         print(f"Building TEST feature matrix for {len(test_timelines)} patients with train tokenization (sparse={use_sparse})")
         X_test, y_test, pids_test, used_sparse_test = build_matrix_for_timelines(
             test_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse
