@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Build random-forest-ready feature matrices (X, y) from processed OMOP tokenization outputs.
+Build random-forest-ready feature matrices (X, y) with temporal split.
 
 Inputs (from a processed data directory):
 - tokenization.yaml: contains 'concepts' listing with token metadata and counts, and 'vocabulary' (ordered)
 - vocabulary.pkl: dict[str token_name -> int token_id]
-- tokenized_timelines.pkl: dict[int patient_id -> list[int token_id]]
+- patient_timelines.pkl: dict[int patient_id -> list[dict events with 'timestamp' and concept ids]]
 
-Behavior:
-- Reads tokenization.yaml and builds the feature list from 'concepts', ordered by 'count' desc
-- For each patient, counts occurrences of each feature token (by token_id) → X (num_patients x num_features)
-- Builds y as a binary vector indicating presence of a specified target concept token in the patient's timeline
-- Optionally excludes the target token from the features (to avoid leakage)
+Temporal behavior:
+- For each patient, determine start_time as the earliest non-static event timestamp
+- First window (train features X): [start_time, start_time + train_days)
+- Second window (labels y): [start_time + train_days, start_time + train_days + test_days)
+- X counts concept tokens occurring in the first window only
+- y=1 if any target concept token occurs in the second window; otherwise 0
+- Target tokens are excluded from X to avoid leakage
 
 Outputs:
-- X.npy (int32), y.npy (int8), patient_ids.npy (int64)
+- X.npy (int32) or X_sparse.npz when --sparse, y.npy (uint8), patient_ids.npy (int64)
 - features.tsv: columns [index, token, concept_id, count]
 """
 
@@ -31,6 +33,7 @@ try:
     import scipy.sparse as sp
 except Exception:
     sp = None
+from datetime import datetime, timedelta
 
 
 CONCEPT_PREFIXES = (
@@ -43,24 +46,31 @@ CONCEPT_PREFIXES = (
 
 def load_processed(data_dir: str):
     vocab_path = os.path.join(data_dir, 'vocabulary.pkl')
-    tt_path = os.path.join(data_dir, 'tokenized_timelines.pkl')
     spec_path = os.path.join(data_dir, 'tokenization.yaml')
-    if not (os.path.exists(vocab_path) and os.path.exists(tt_path) and os.path.exists(spec_path)):
-        raise FileNotFoundError(f"Missing required files in {data_dir}. Need vocabulary.pkl, tokenized_timelines.pkl, tokenization.yaml")
-    
+    pt_path = os.path.join(data_dir, 'patient_timelines.pkl')
+    missing = []
+    if not os.path.exists(vocab_path):
+        missing.append('vocabulary.pkl')
+    if not os.path.exists(spec_path):
+        missing.append('tokenization.yaml')
+    if not os.path.exists(pt_path):
+        missing.append('patient_timelines.pkl')
+    if missing:
+        raise FileNotFoundError(f"Missing required files in {data_dir}: {', '.join(missing)}")
+
     print("Loading vocabulary...")
     with open(vocab_path, 'rb') as f:
         vocab: Dict[str, int] = pickle.load(f)
-    
-    print("Loading tokenized timelines...")
-    with open(tt_path, 'rb') as f:
-        tokenized_timelines: Dict[int, List[int]] = pickle.load(f)
-    
+
+    print("Loading patient timelines...")
+    with open(pt_path, 'rb') as f:
+        patient_timelines: Dict[int, List[Dict]] = pickle.load(f)
+
     print("Loading tokenization specification...")
     with open(spec_path, 'r') as f:
         spec = yaml.safe_load(f)
-    
-    return vocab, tokenized_timelines, spec
+
+    return vocab, patient_timelines, spec
 
 
 def feature_tokens_from_spec(spec: dict, min_count: int = 0) -> List[Tuple[str, int]]:
@@ -97,6 +107,46 @@ def expand_variants_from_concept_id(spec: dict, concept_id: int) -> List[str]:
     return out
 
 
+def event_to_token_name(event: Dict) -> Optional[str]:
+    """Map a patient timeline event to a concept token name used in vocabulary.
+    Only concept-bearing events are considered.
+    """
+    et = event.get('event_type')
+    if et == 'condition':
+        cid = event.get('condition_concept_id')
+        if cid is not None:
+            return f"CONDITION_OCCURRENCE_{int(cid)}"
+    elif et == 'medication':
+        cid = event.get('drug_concept_id')
+        if cid is not None:
+            return f"DRUG_EXPOSURE_{int(cid)}"
+    elif et == 'procedure':
+        cid = event.get('procedure_concept_id')
+        if cid is not None:
+            return f"PROCEDURE_OCCURRENCE_{int(cid)}"
+    elif et == 'measurement':
+        cid = event.get('measurement_concept_id')
+        if cid is not None:
+            return f"MEASUREMENT_{int(cid)}"
+    elif et == 'observation':
+        cid = event.get('observation_concept_id')
+        if cid is not None:
+            return f"OBSERVATION_{int(cid)}"
+    return None
+
+
+def find_start_time(timeline: List[Dict]) -> Optional[datetime]:
+    """Earliest timestamp among non-static events; returns None if not found."""
+    start: Optional[datetime] = None
+    for ev in timeline:
+        if ev.get('event_type') in { 'condition','medication','procedure','measurement','observation','admission','discharge','death' }:
+            ts = ev.get('timestamp')
+            if isinstance(ts, datetime):
+                if start is None or ts < start:
+                    start = ts
+    return start
+
+
 def main():
     ap = argparse.ArgumentParser(description='Build RF feature matrix (X, y) from processed tokenization outputs')
     ap.add_argument('--data_dir', required=True, help='Processed data directory (with tokenization.yaml, vocabulary.pkl, tokenized_timelines.pkl)')
@@ -104,12 +154,14 @@ def main():
     ap.add_argument('--min_count', type=int, default=0, help='Drop tokens with total count < min_count (from spec)')
     ap.add_argument('--sparse', action='store_true', help='Build a sparse CSR matrix (saves X_sparse.npz) to reduce RAM')
     ap.add_argument('--target_concept_id', type=int, default=None, help='Target concept_id; all tokens in spec with this concept_id will be removed and added to y')
+    ap.add_argument('--train_days', type=int, default=365, help='Length of first window in days for features (default: 365)')
+    ap.add_argument('--test_days', type=int, default=365, help='Length of second window in days for labels (default: 365)')
     args = ap.parse_args()
 
     out_dir = args.out_dir or f"{args.data_dir.rstrip(os.sep)}_rf"
     os.makedirs(out_dir, exist_ok=True)
 
-    vocab, tokenized_timelines, spec = load_processed(args.data_dir)
+    vocab, patient_timelines, spec = load_processed(args.data_dir)
 
     # Derive target token name(s)
     target_tokens = expand_variants_from_concept_id(spec, int(args.target_concept_id))
@@ -155,8 +207,8 @@ def main():
     if not target_id_set:
         raise ValueError('Resolved target token(s) are not present in vocabulary')
 
-    # Build X and y
-    patient_ids = sorted(tokenized_timelines.keys())
+    # Build X and y with temporal split
+    patient_ids = sorted(patient_timelines.keys())
     num_patients = len(patient_ids)
     num_features = len(feature_tokens)
     y = np.zeros((num_patients,), dtype=np.uint8)
@@ -164,11 +216,13 @@ def main():
     feature_id_to_col = {tid: col for col, tid in enumerate(feature_ids) if tid != -1}
 
     use_sparse = bool(args.sparse)
-    # Auto-enable sparse if very wide
     if not use_sparse and num_features > 10000:
         use_sparse = True
 
-    print(f"Building feature matrix for {num_patients} patients... (sparse={use_sparse})")
+    train_delta = timedelta(days=int(args.train_days))
+    test_delta = timedelta(days=int(args.test_days))
+
+    print(f"Building feature matrix for {num_patients} patients with temporal split (sparse={use_sparse})")
     if use_sparse:
         if sp is None:
             raise RuntimeError("scipy is required for --sparse output (pip install scipy)")
@@ -176,28 +230,101 @@ def main():
         cols: List[int] = []
         data: List[int] = []
         for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
-            seq = tokenized_timelines[pid]
-            counts = Counter(seq)
-            # Emit only non-zero features
-            for tid, cnt in counts.items():
+            timeline = patient_timelines.get(pid, [])
+            start = find_start_time(timeline)
+            if start is None:
+                # No events; leave row zeros and y=0
+                y[row] = 0
+                continue
+            train_end = start + train_delta
+            test_end = train_end + test_delta
+
+            # Count features in first window
+            counts: Dict[int, int] = {}
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < start or ts >= train_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab.get(tok)
+                if tid is None:
+                    continue
                 col = feature_id_to_col.get(tid)
-                if col is not None and cnt:
-                    rows.append(row)
-                    cols.append(col)
-                    data.append(int(cnt))
-            # Target label: presence of any target id
-            y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
+                if col is None:
+                    continue
+                counts[col] = counts.get(col, 0) + 1
+            # Emit sparse entries
+            for col, cnt in counts.items():
+                rows.append(row)
+                cols.append(col)
+                data.append(int(cnt))
+
+            # Label from second window: presence of target id
+            label = 0
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < train_end or ts >= test_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab.get(tok)
+                if tid in target_id_set:
+                    label = 1
+                    break
+            y[row] = label
         X_sparse = sp.coo_matrix((data, (rows, cols)), shape=(num_patients, num_features), dtype=np.int32).tocsr()
     else:
         X = np.zeros((num_patients, num_features), dtype=np.int32)
         for row, pid in tqdm(enumerate(patient_ids), total=num_patients, desc="Processing patients"):
-            seq = tokenized_timelines[pid]
-            counts = Counter(seq)
-            # Features
-            for tid, col in feature_id_to_col.items():
-                X[row, col] = counts.get(tid, 0)
-            # Target label: presence of any target id
-            y[row] = 1 if any((tid in counts) for tid in target_id_set) else 0
+            timeline = patient_timelines.get(pid, [])
+            start = find_start_time(timeline)
+            if start is None:
+                y[row] = 0
+                continue
+            train_end = start + train_delta
+            test_end = train_end + test_delta
+
+            # Features from first window
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < start or ts >= train_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab.get(tok)
+                if tid is None:
+                    continue
+                col = feature_id_to_col.get(tid)
+                if col is None:
+                    continue
+                X[row, col] += 1
+
+            # Label from second window
+            label = 0
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < train_end or ts >= test_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab.get(tok)
+                if tid in target_id_set:
+                    label = 1
+                    break
+            y[row] = label
 
     # Save outputs
     print("Saving outputs...")

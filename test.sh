@@ -1,7 +1,7 @@
 MODEL_ROOT=/home/jupyter/workspaces/ehrtransformerbaselinecdr8/simple_ehr_transformer/models/aou_2021_2022
 
 python test.py \
-  --debug_samples 1 \
+  --debug_samples 10 \
   --model_path $MODEL_ROOT/latest_checkpoint.pth \
   --current_data_dir processed_data_aou_2021_2022/train \
   --future_data_dir processed_data_aou_2023 \
