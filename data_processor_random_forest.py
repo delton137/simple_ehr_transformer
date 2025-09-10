@@ -240,6 +240,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     vocab, patient_timelines, spec = load_processed(args.data_dir)
+    if not isinstance(patient_timelines, dict) or len(patient_timelines) == 0:
+        print("Train patient_timelines.pkl missing or empty; attempting events_partitioned fallback...")
+        patient_timelines = load_patient_timelines_only(args.data_dir, allow_events_fallback=True)
+    print(f"TRAIN patients available: {len(patient_timelines)}")
 
     # Derive target token name(s)
     target_tokens = expand_variants_from_concept_id(spec, int(args.target_concept_id))
@@ -438,6 +442,7 @@ def main():
         test_out_dir = args.test_out_dir or f"{args.test_data_dir.rstrip(os.sep)}_rf"
         os.makedirs(test_out_dir, exist_ok=True)
         test_timelines = load_patient_timelines_only(args.test_data_dir, allow_events_fallback=True)
+        print(f"TEST patients available: {len(test_timelines)}")
         print(f"Building TEST feature matrix for {len(test_timelines)} patients with train tokenization (sparse={use_sparse})")
         X_test, y_test, pids_test, used_sparse_test = build_matrix_for_timelines(
             test_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse
