@@ -30,12 +30,12 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import Counter
 from tqdm import tqdm
-try:
-    import scipy.sparse as sp
-except Exception:
-    sp = None
+import scipy.sparse as sp
 from datetime import datetime, timedelta
 import pandas as pd
+import multiprocessing as mp
+from functools import partial
+import gc
 
 
 CONCEPT_PREFIXES = (
@@ -75,30 +75,34 @@ def load_processed(data_dir: str):
     return vocab, patient_timelines, spec
 
 
-def build_timelines_from_events_partitioned(data_dir: str) -> Dict[int, List[dict]]:
-    """Reconstruct minimal timelines from events_partitioned parquet files.
-    Requires columns: person_id, ts, et, cid, value_as_number, unit_concept_id
-    """
-    base = os.path.join(data_dir, 'events_partitioned')
-    if not os.path.isdir(base):
-        raise FileNotFoundError(f"events_partitioned directory not found in {data_dir}")
-    from pathlib import Path
-    files = list(Path(base).rglob('*.parquet'))
+def process_single_parquet_file(file_path: str) -> Dict[int, List[dict]]:
+    """Process a single parquet file and return patient timelines."""
     timelines: Dict[int, List[dict]] = {}
-    for fp in tqdm(files, desc='Reconstructing timelines from events_partitioned', unit='file'):
-        try:
-            df = pd.read_parquet(str(fp))
-        except Exception:
-            continue
-        if df is None or len(df) == 0:
-            continue
-        required = [c for c in ['person_id','ts','et','cid','value_as_number','unit_concept_id'] if c in df.columns]
-        if not {'person_id','ts','et','cid'}.issubset(set(required)):
-            continue
-        df = df.sort_values(['person_id','ts'])
-        for pid, sub in df.groupby('person_id'):
+    try:
+        df = pd.read_parquet(file_path)
+    except Exception:
+        return timelines
+    
+    if df is None or len(df) == 0:
+        return timelines
+    
+    required = [c for c in ['person_id','ts','et','cid','value_as_number','unit_concept_id'] if c in df.columns]
+    if not {'person_id','ts','et','cid'}.issubset(set(required)):
+        return timelines
+    
+    # Optimize: use vectorized operations instead of iterrows
+    df = df.sort_values(['person_id','ts'])
+    
+    # Process in chunks to reduce memory usage
+    chunk_size = 10000
+    for start_idx in range(0, len(df), chunk_size):
+        chunk = df.iloc[start_idx:start_idx + chunk_size]
+        
+        for pid, sub in chunk.groupby('person_id'):
             pid = int(pid)
             seq = timelines.get(pid, [])
+            
+            # Vectorized processing instead of row-by-row
             for _, row in sub.iterrows():
                 ts = row.get('ts')
                 et = row.get('et')
@@ -121,14 +125,65 @@ def build_timelines_from_events_partitioned(data_dir: str) -> Dict[int, List[dic
                 elif et == 'observation':
                     ev['observation_concept_id'] = int(cid)
                 seq.append(ev)
+            
             if seq:
                 # ensure sorted
                 seq.sort(key=lambda e: e.get('timestamp'))
                 timelines[pid] = seq
+        
+        # Clear chunk from memory
+        del chunk
+        gc.collect()
+    
     return timelines
 
 
-def load_patient_timelines_only(data_dir: str, allow_events_fallback: bool = True) -> Dict[int, List[dict]]:
+def build_timelines_from_events_partitioned(data_dir: str, n_processes: int = None) -> Dict[int, List[dict]]:
+    """Reconstruct minimal timelines from events_partitioned parquet files using multiprocessing.
+    Requires columns: person_id, ts, et, cid, value_as_number, unit_concept_id
+    """
+    base = os.path.join(data_dir, 'events_partitioned')
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"events_partitioned directory not found in {data_dir}")
+    
+    from pathlib import Path
+    files = [str(fp) for fp in Path(base).rglob('*.parquet')]
+    
+    if not files:
+        return {}
+    
+    # Use all available CPUs if not specified
+    if n_processes is None:
+        n_processes = min(mp.cpu_count(), len(files))
+    
+    print(f"Processing {len(files)} parquet files using {n_processes} processes...")
+    
+    # Process files in parallel
+    with mp.Pool(processes=n_processes) as pool:
+        results = list(tqdm(
+            pool.imap(process_single_parquet_file, files),
+            total=len(files),
+            desc='Reconstructing timelines from events_partitioned',
+            unit='file'
+        ))
+    
+    # Merge results from all processes
+    print("Merging results from parallel processing...")
+    timelines: Dict[int, List[dict]] = {}
+    for result in tqdm(results, desc="Merging patient timelines"):
+        for pid, events in result.items():
+            if pid in timelines:
+                # Merge and sort events
+                timelines[pid].extend(events)
+                timelines[pid].sort(key=lambda e: e.get('timestamp'))
+            else:
+                timelines[pid] = events
+    
+    print(f"Reconstructed timelines for {len(timelines)} patients")
+    return timelines
+
+
+def load_patient_timelines_only(data_dir: str, allow_events_fallback: bool = True, n_processes: int = None) -> Dict[int, List[dict]]:
     """Load patient_timelines.pkl; optionally fallback to events_partitioned if empty/missing."""
     pt_path = os.path.join(data_dir, 'patient_timelines.pkl')
     timelines: Optional[Dict[int, List[dict]]] = None
@@ -143,7 +198,7 @@ def load_patient_timelines_only(data_dir: str, allow_events_fallback: bool = Tru
             timelines = None
     if timelines is None and allow_events_fallback:
         print("patient_timelines.pkl missing or empty; falling back to events_partitioned reconstruction...")
-        timelines = build_timelines_from_events_partitioned(data_dir)
+        timelines = build_timelines_from_events_partitioned(data_dir, n_processes)
     if timelines is None:
         raise FileNotFoundError(f"Could not load timelines from {data_dir}")
     return timelines
@@ -223,6 +278,124 @@ def find_start_time(timeline: List[Dict]) -> Optional[datetime]:
     return start
 
 
+def process_patient_chunk(args_tuple):
+    """Process a chunk of patients for matrix building. Returns (X_chunk, y_chunk, patient_ids_chunk)."""
+    (patient_chunk, vocab_map, feature_id_to_col, target_id_set_local, 
+     train_days, test_days, want_sparse, feature_tokens_len) = args_tuple
+    
+    n_pat = len(patient_chunk)
+    n_feat = len(feature_id_to_col)
+    y_chunk = np.zeros((n_pat,), dtype=np.uint8)
+    
+    train_delta = timedelta(days=int(train_days))
+    test_delta = timedelta(days=int(test_days))
+    
+    if want_sparse:
+        rows: List[int] = []
+        cols: List[int] = []
+        data: List[int] = []
+        
+        for row, (pid, timeline) in enumerate(patient_chunk):
+            start = find_start_time(timeline)
+            if start is None:
+                y_chunk[row] = 0
+                continue
+            
+            train_end = start + train_delta
+            test_end = train_end + test_delta
+            counts: Dict[int, int] = {}
+            
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < start or ts >= train_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab_map.get(tok)
+                if tid is None:
+                    continue
+                col = feature_id_to_col.get(tid)
+                if col is None:
+                    continue
+                counts[col] = counts.get(col, 0) + 1
+            
+            for col, cnt in counts.items():
+                rows.append(row)
+                cols.append(col)
+                data.append(int(cnt))
+            
+            # Check for target events in test window
+            label = 0
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < train_end or ts >= test_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab_map.get(tok)
+                if tid in target_id_set_local:
+                    label = 1
+                    break
+            y_chunk[row] = label
+        
+        X_chunk = sp.coo_matrix((data, (rows, cols)), shape=(n_pat, feature_tokens_len), dtype=np.int32).tocsr()
+        return X_chunk, y_chunk, [pid for pid, _ in patient_chunk]
+    
+    else:
+        X_chunk = np.zeros((n_pat, feature_tokens_len), dtype=np.int32)
+        
+        for row, (pid, timeline) in enumerate(patient_chunk):
+            start = find_start_time(timeline)
+            if start is None:
+                y_chunk[row] = 0
+                continue
+            
+            train_end = start + train_delta
+            test_end = train_end + test_delta
+            
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < start or ts >= train_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab_map.get(tok)
+                if tid is None:
+                    continue
+                col = feature_id_to_col.get(tid)
+                if col is None:
+                    continue
+                X_chunk[row, col] += 1
+            
+            # Check for target events in test window
+            label = 0
+            for ev in timeline:
+                ts = ev.get('timestamp')
+                if not isinstance(ts, datetime):
+                    continue
+                if ts < train_end or ts >= test_end:
+                    continue
+                tok = event_to_token_name(ev)
+                if tok is None:
+                    continue
+                tid = vocab_map.get(tok)
+                if tid in target_id_set_local:
+                    label = 1
+                    break
+            y_chunk[row] = label
+        
+        return X_chunk, y_chunk, [pid for pid, _ in patient_chunk]
+
+
 def main():
     ap = argparse.ArgumentParser(description='Build RF feature matrix (X, y) from processed tokenization outputs')
     ap.add_argument('--data_dir', required=True, help='Processed data directory (with tokenization.yaml, vocabulary.pkl, tokenized_timelines.pkl)')
@@ -234,6 +407,8 @@ def main():
     ap.add_argument('--test_days', type=int, default=365, help='Length of second window in days for labels (default: 365)')
     ap.add_argument('--test_data_dir', type=str, default=None, help='Optional processed test data directory (uses train tokenization)')
     ap.add_argument('--test_out_dir', type=str, default=None, help='Optional output dir for test matrices (default: <test_data_dir>_rf)')
+    ap.add_argument('--n_processes', type=int, default=None, help='Number of processes to use for parallel processing (default: auto-detect)')
+    ap.add_argument('--chunk_size', type=int, default=100, help='Minimum number of patients per process chunk (default: 100)')
     args = ap.parse_args()
 
     out_dir = args.out_dir or f"{args.data_dir.rstrip(os.sep)}_rf"
@@ -242,7 +417,7 @@ def main():
     vocab, patient_timelines, spec = load_processed(args.data_dir)
     if not isinstance(patient_timelines, dict) or len(patient_timelines) == 0:
         print("Train patient_timelines.pkl missing or empty; attempting events_partitioned fallback...")
-        patient_timelines = load_patient_timelines_only(args.data_dir, allow_events_fallback=True)
+        patient_timelines = load_patient_timelines_only(args.data_dir, allow_events_fallback=True, n_processes=args.n_processes)
     print(f"TRAIN patients available: {len(patient_timelines)}")
 
     # Derive target token name(s)
@@ -295,110 +470,83 @@ def main():
                                    target_id_set_local: set,
                                    train_days: int,
                                    test_days: int,
-                                   want_sparse: bool):
-        """Build X/y given timelines and a fixed feature mapping."""
+                                   want_sparse: bool,
+                                   n_processes: int = None,
+                                   chunk_size: int = 100):
+        """Build X/y given timelines and a fixed feature mapping using multiprocessing."""
         patient_ids_local = sorted(pt.keys())
         n_pat = len(patient_ids_local)
         n_feat = len(feature_id_to_col)
-        y_local = np.zeros((n_pat,), dtype=np.uint8)
         use_sparse_local = bool(want_sparse)
         if not use_sparse_local and n_feat > 10000:
             use_sparse_local = True
-        train_delta_local = timedelta(days=int(train_days))
-        test_delta_local = timedelta(days=int(test_days))
+        
+        if use_sparse_local and sp is None:
+            raise RuntimeError("scipy is required for --sparse output (pip install scipy)")
+        
+        # Use all available CPUs if not specified
+        if n_processes is None:
+            n_processes = min(mp.cpu_count(), n_pat // 100 + 1)  # At least 100 patients per process
+        
+        # Split patients into chunks for parallel processing
+        actual_chunk_size = max(chunk_size, n_pat // n_processes)
+        patient_chunks = []
+        for i in range(0, n_pat, actual_chunk_size):
+            chunk = [(patient_ids_local[j], pt[patient_ids_local[j]]) for j in range(i, min(i + actual_chunk_size, n_pat))]
+            patient_chunks.append(chunk)
+        
+        print(f"Processing {n_pat} patients using {n_processes} processes in {len(patient_chunks)} chunks...")
+        
+        # Prepare arguments for each chunk
+        chunk_args = []
+        for chunk in patient_chunks:
+            args_tuple = (chunk, vocab_map, feature_id_to_col, target_id_set_local, 
+                         train_days, test_days, use_sparse_local, len(feature_tokens))
+            chunk_args.append(args_tuple)
+        
+        # Process chunks in parallel
+        with mp.Pool(processes=n_processes) as pool:
+            results = list(tqdm(
+                pool.imap(process_patient_chunk, chunk_args),
+                total=len(chunk_args),
+                desc="Processing patient chunks",
+                unit="chunk"
+            ))
+        
+        # Combine results from all chunks
+        print("Combining results from parallel processing...")
         if use_sparse_local:
-            if sp is None:
-                raise RuntimeError("scipy is required for --sparse output (pip install scipy)")
-            rows: List[int] = []
-            cols: List[int] = []
-            data: List[int] = []
-            for row, pid in tqdm(enumerate(patient_ids_local), total=n_pat, desc="Processing patients"):
-                timeline = pt.get(pid, [])
-                start = find_start_time(timeline)
-                if start is None:
-                    y_local[row] = 0
-                    continue
-                train_end = start + train_delta_local
-                test_end = train_end + test_delta_local
-                counts: Dict[int, int] = {}
-                for ev in timeline:
-                    ts = ev.get('timestamp')
-                    if not isinstance(ts, datetime):
-                        continue
-                    if ts < start or ts >= train_end:
-                        continue
-                    tok = event_to_token_name(ev)
-                    if tok is None:
-                        continue
-                    tid = vocab_map.get(tok)
-                    if tid is None:
-                        continue
-                    col = feature_id_to_col.get(tid)
-                    if col is None:
-                        continue
-                    counts[col] = counts.get(col, 0) + 1
-                for col, cnt in counts.items():
-                    rows.append(row)
-                    cols.append(col)
-                    data.append(int(cnt))
-                label = 0
-                for ev in timeline:
-                    ts = ev.get('timestamp')
-                    if not isinstance(ts, datetime):
-                        continue
-                    if ts < train_end or ts >= test_end:
-                        continue
-                    tok = event_to_token_name(ev)
-                    if tok is None:
-                        continue
-                    tid = vocab_map.get(tok)
-                    if tid in target_id_set_local:
-                        label = 1
-                        break
-                y_local[row] = label
-            X_local = sp.coo_matrix((data, (rows, cols)), shape=(n_pat, len(feature_tokens)), dtype=np.int32).tocsr()
+            # Combine sparse matrices
+            X_chunks = []
+            y_chunks = []
+            patient_id_chunks = []
+            
+            for X_chunk, y_chunk, pid_chunk in results:
+                X_chunks.append(X_chunk)
+                y_chunks.append(y_chunk)
+                patient_id_chunks.extend(pid_chunk)
+            
+            # Concatenate sparse matrices
+            X_local = sp.vstack(X_chunks, format='csr')
+            y_local = np.concatenate(y_chunks)
+            patient_ids_array = np.array(patient_id_chunks, dtype=np.int64)
         else:
-            X_local = np.zeros((n_pat, len(feature_tokens)), dtype=np.int32)
-            for row, pid in tqdm(enumerate(patient_ids_local), total=n_pat, desc="Processing patients"):
-                timeline = pt.get(pid, [])
-                start = find_start_time(timeline)
-                if start is None:
-                    y_local[row] = 0
-                    continue
-                train_end = start + train_delta_local
-                test_end = train_end + test_delta_local
-                for ev in timeline:
-                    ts = ev.get('timestamp')
-                    if not isinstance(ts, datetime):
-                        continue
-                    if ts < start or ts >= train_end:
-                        continue
-                    tok = event_to_token_name(ev)
-                    if tok is None:
-                        continue
-                    tid = vocab_map.get(tok)
-                    if tid is None:
-                        continue
-                    col = feature_id_to_col.get(tid)
-                    if col is None:
-                        continue
-                    X_local[row, col] += 1
-                label = 0
-                for ev in timeline:
-                    ts = ev.get('timestamp')
-                    if not isinstance(ts, datetime):
-                        continue
-                    if ts < train_end or ts >= test_end:
-                        continue
-                    tok = event_to_token_name(ev)
-                    if tok is None:
-                        continue
-                    tid = vocab_map.get(tok)
-                    if tid in target_id_set_local:
-                        label = 1
-                        break
-                y_local[row] = label
-        return X_local, y_local, np.array(patient_ids_local, dtype=np.int64), use_sparse_local
+            # Combine dense matrices
+            X_chunks = []
+            y_chunks = []
+            patient_id_chunks = []
+            
+            for X_chunk, y_chunk, pid_chunk in results:
+                X_chunks.append(X_chunk)
+                y_chunks.append(y_chunk)
+                patient_id_chunks.extend(pid_chunk)
+            
+            # Concatenate dense matrices
+            X_local = np.vstack(X_chunks)
+            y_local = np.concatenate(y_chunks)
+            patient_ids_array = np.array(patient_id_chunks, dtype=np.int64)
+        
+        return X_local, y_local, patient_ids_array, use_sparse_local
 
     # Build mapping structures
     feature_id_to_col = {tid: col for col, tid in enumerate(feature_ids) if tid != -1}
@@ -407,7 +555,7 @@ def main():
         use_sparse = True
     print(f"Building TRAIN feature matrix for {len(patient_timelines)} patients with temporal split (sparse={use_sparse})")
     X_train, y_train, pids_train, used_sparse_train = build_matrix_for_timelines(
-        patient_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse
+        patient_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse, args.n_processes, args.chunk_size
     )
 
     # Save outputs
@@ -441,11 +589,11 @@ def main():
     if args.test_data_dir:
         test_out_dir = args.test_out_dir or f"{args.test_data_dir.rstrip(os.sep)}_rf"
         os.makedirs(test_out_dir, exist_ok=True)
-        test_timelines = load_patient_timelines_only(args.test_data_dir, allow_events_fallback=True)
+        test_timelines = load_patient_timelines_only(args.test_data_dir, allow_events_fallback=True, n_processes=args.n_processes)
         print(f"TEST patients available: {len(test_timelines)}")
         print(f"Building TEST feature matrix for {len(test_timelines)} patients with train tokenization (sparse={use_sparse})")
         X_test, y_test, pids_test, used_sparse_test = build_matrix_for_timelines(
-            test_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse
+            test_timelines, vocab, feature_id_to_col, target_id_set, args.train_days, args.test_days, use_sparse, args.n_processes, args.chunk_size
         )
         print("Saving TEST outputs...")
         if used_sparse_test:
