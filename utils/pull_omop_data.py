@@ -88,23 +88,23 @@ pull_data(
     output_root = "omop_data_2021",
     )
 
-#pull_data( 
-#    start_date = "2022-01-01",
-#    end_date = "2023-01-01",
-#    output_root = "omop_data_2022",
-#    )#
+pull_data( 
+    start_date = "2022-01-01",
+    end_date = "2023-01-01",
+    output_root = "omop_data_2022",
+    )#
 
-#pull_data( 
-#    start_date = "2023-01-01",
-#    end_date = "2024-01-01",
-#    output_root = "omop_data_2023",
-#    )
+pull_data( 
+    start_date = "2023-01-01",
+    end_date = "2024-01-01",
+    output_root = "omop_data_2023",
+    )
 
-#pull_data( 
-#    start_date = "2024-01-01",
-#    end_date = "2025-01-01",
-#    output_root = "omop_data_2024",
-#    )
+pull_data( 
+    start_date = "2024-01-01",
+    end_date = "2025-01-01",
+    output_root = "omop_data_2024",
+    )
 
 #pull_data( 
 #    start_date = "2021-01-01",
@@ -115,5 +115,5 @@ pull_data(
 #pull_data( 
 #    start_date = "2021-01-01",
 #    end_date = "2024-01-01",
-#    output_root = "omop_data_2021_2022_2023",
+#    output_root = "omop_data_2020_2021_2022",
 #    )
