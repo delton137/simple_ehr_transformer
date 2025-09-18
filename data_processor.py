@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import logging
 from tqdm import tqdm
 import pickle
+import json
 from collections import defaultdict, Counter
 import gc
 import psutil
@@ -89,6 +90,53 @@ class OMOPDataProcessor:
             "measurement": "MEASUREMENT_",
             "observation": "OBSERVATION_",
         }
+
+    # =====================
+    # Train/Test split helpers
+    # =====================
+    def _split_train_test(self, person_ids: List[int], train_ratio: float = 0.8, seed: int = 42) -> Tuple[set, set]:
+        """Split person IDs into train/test sets deterministically.
+        Returns (train_ids_set, test_ids_set).
+        """
+        rng = np.random.RandomState(seed)
+        ids = list(sorted(set(int(pid) for pid in person_ids)))
+        rng.shuffle(ids)
+        n_train = int(round(len(ids) * train_ratio))
+        train_ids = set(ids[:n_train])
+        test_ids = set(ids[n_train:])
+        return train_ids, test_ids
+
+    def _save_split_metadata(self, train_ids: set, test_ids: set) -> None:
+        os.makedirs(os.path.join(data_config.output_dir, 'train'), exist_ok=True)
+        os.makedirs(os.path.join(data_config.output_dir, 'test'), exist_ok=True)
+        # Save person IDs per split
+        with open(os.path.join(data_config.output_dir, 'train', 'person_ids.json'), 'w') as f:
+            json.dump(sorted(int(x) for x in train_ids), f)
+        with open(os.path.join(data_config.output_dir, 'test', 'person_ids.json'), 'w') as f:
+            json.dump(sorted(int(x) for x in test_ids), f)
+        # Convenience copy of test ids at root
+        with open(os.path.join(data_config.output_dir, 'test_person_ids.json'), 'w') as f:
+            json.dump(sorted(int(x) for x in test_ids), f)
+
+    def _write_tokenization_spec(self) -> None:
+        """Write a JSON spec describing tokenization artifacts to output_dir/tokenization.json"""
+        spec = {
+            'special_tokens': {
+                'pad': token_config.pad_token,
+                'unk': token_config.unk_token,
+                'eos': token_config.eos_token,
+                'sos': token_config.sos_token,
+            },
+            'age_mappings': self.age_mappings,
+            'time_interval_mappings': self.time_interval_mappings,
+            'max_quantile_tokens': model_config.max_quantile_tokens,
+            'event_type_prefix': self.event_type_prefix,
+            'vocab': self.vocab,
+        }
+        with open(os.path.join(data_config.output_dir, 'tokenization.json'), 'w') as f:
+            json.dump(spec, f)
+
+    
 
     # =====================
     # Fast path (Polars)
@@ -472,8 +520,14 @@ class OMOPDataProcessor:
         logger.info(f"[FAST] Vocabulary size: {self.vocab_size}")
         # Tokenize from partitions
         tokenized_timelines = self._tokenize_from_partitions(person_data)
-        # Save
-        self._save_processed_data(tokenized_timelines, {})
+        # Train/Test split by person IDs
+        all_person_ids = list(person_data.keys())
+        train_ids, test_ids = self._split_train_test(all_person_ids, train_ratio=0.8, seed=42)
+        self._save_split_metadata(train_ids, test_ids)
+        tokenized_train = {pid: seq for pid, seq in tokenized_timelines.items() if pid in train_ids}
+        tokenized_test = {pid: seq for pid, seq in tokenized_timelines.items() if pid in test_ids}
+        # Save per-split and shared artifacts
+        self._save_processed_data_split(tokenized_train, tokenized_test, None, None)
         return tokenized_timelines, self.vocab
 
     # =====================
@@ -1600,7 +1654,18 @@ class OMOPDataProcessor:
                 pbar.update(1)
             gc.collect()
         pbar.close()
-        self._save_processed_data(tokenized_timelines, patient_timelines)
+        # Train/Test split by person IDs
+        all_person_ids = list(patient_timelines.keys())
+        train_ids, test_ids = self._split_train_test(all_person_ids, train_ratio=0.8, seed=42)
+        self._save_split_metadata(train_ids, test_ids)
+        # Split tokenized timelines
+        tokenized_train = {pid: seq for pid, seq in tokenized_timelines.items() if pid in train_ids}
+        tokenized_test = {pid: seq for pid, seq in tokenized_timelines.items() if pid in test_ids}
+        # Split raw patient timelines (for reference)
+        patient_timelines_train = {pid: tl for pid, tl in patient_timelines.items() if pid in train_ids}
+        patient_timelines_test = {pid: tl for pid, tl in patient_timelines.items() if pid in test_ids}
+        # Save per-split and shared artifacts
+        self._save_processed_data_split(tokenized_train, tokenized_test, patient_timelines_train, patient_timelines_test)
         return tokenized_timelines, self.vocab
     
     def _save_processed_data(self, tokenized_timelines: Dict[int, List[int]], 
@@ -1623,6 +1688,50 @@ class OMOPDataProcessor:
             pickle.dump(patient_timelines, f)
         
         logger.info(f"Saved processed data to {data_config.output_dir}")
+
+    def _save_processed_data_split(self, 
+                           tokenized_train: Dict[int, List[int]],
+                           tokenized_test: Dict[int, List[int]],
+                           patient_timelines_train: Optional[Dict[int, List[Dict]]] = None,
+                           patient_timelines_test: Optional[Dict[int, List[Dict]]] = None):
+        """Save processed data to train/ and test/ subfolders, plus combined copies at root for compatibility."""
+        out_root = data_config.output_dir
+        out_train = os.path.join(out_root, 'train')
+        out_test = os.path.join(out_root, 'test')
+        os.makedirs(out_train, exist_ok=True)
+        os.makedirs(out_test, exist_ok=True)
+
+        # Save per-split tokenized timelines
+        with open(os.path.join(out_train, 'tokenized_timelines.pkl'), 'wb') as f:
+            pickle.dump(tokenized_train, f)
+        with open(os.path.join(out_test, 'tokenized_timelines.pkl'), 'wb') as f:
+            pickle.dump(tokenized_test, f)
+
+        # Save combined at root for backwards compatibility
+        combined_tokenized = {**tokenized_train, **tokenized_test}
+        with open(os.path.join(out_root, 'tokenized_timelines.pkl'), 'wb') as f:
+            pickle.dump(combined_tokenized, f)
+
+        # Save raw timelines per split if provided, and combined at root if available
+        if patient_timelines_train is not None:
+            with open(os.path.join(out_train, 'patient_timelines.pkl'), 'wb') as f:
+                pickle.dump(patient_timelines_train, f)
+        if patient_timelines_test is not None:
+            with open(os.path.join(out_test, 'patient_timelines.pkl'), 'wb') as f:
+                pickle.dump(patient_timelines_test, f)
+        if patient_timelines_train is not None and patient_timelines_test is not None:
+            combined_pt = {**patient_timelines_train, **patient_timelines_test}
+            with open(os.path.join(out_root, 'patient_timelines.pkl'), 'wb') as f:
+                pickle.dump(combined_pt, f)
+
+        # Save shared artifacts at root
+        with open(os.path.join(out_root, 'vocabulary.pkl'), 'wb') as f:
+            pickle.dump(self.vocab, f)
+        with open(os.path.join(out_root, 'quantile_mappings.pkl'), 'wb') as f:
+            pickle.dump(self.quantile_mappings, f)
+        # Tokenization spec JSON
+        self._write_tokenization_spec()
+        logger.info(f"Saved processed split data to {out_root} (train/ and test/)")
     
     def load_processed_data(self) -> Tuple[Dict[int, List[int]], Dict[str, int]]:
         """Load previously processed data"""
